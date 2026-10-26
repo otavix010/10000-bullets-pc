@@ -1,0 +1,14 @@
+{
+  "nome": "10.000 Bullets",
+  "serial": "SLES-53481",
+  "elf": "SLES_534.81",
+  "cd_root": "",
+  "exe": "10000bullets.exe",
+  "iso_sha1": [
+    "ef6d3c9563d0dca493e25de204cdcafe6f4c336d"
+  ],
+  "elf_sha1": [
+    "8ca31a221c4f9ce81c9d3656baa66e66f60112d5"
+  ],
+  "versao": "europeia, SLES-53481"
+}

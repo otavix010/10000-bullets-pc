@@ -1,0 +1,2 @@
+ret0@0x00632EA0  # instalador do remendo de kernel da SDK (igual ao do MoH): copia codigo para 0x80075000 e aponta as syscalls 0x5b/0x55-0x59 para la; esse codigo nao existe traduzido e a thread morria
+sceCdSearchFile@0x00636290  # sceCdSearchFile -> sceCdLayerSearchFile(0x635F78) faz bind no servidor 0x80000597 do IOP, que nao existe (laco eterno); o runtime acha o arquivo direto na ISO

@@ -1,0 +1,2675 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..7cec9fe 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -31,6 +31,8 @@ namespace ps2x::iop
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
++        // Otavix: comando SIF do EE para um tratador registrado por um IRX no IOP emulado
++        [[nodiscard]] bool deliverEeSifCommand(uint32_t cid, const void *packet, uint32_t size);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..cc60f40 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -3,6 +3,7 @@
+ #include "iop_memory.h"
+ #include "../iop_emulator_const.h"
+ 
++#include <cstdio>
+ #include <algorithm>
+ 
+ namespace ps2x::iop::detail
+@@ -350,6 +351,15 @@ namespace ps2x::iop::detail
+         return true;
+     }
+ 
++    void IopKernel::otxImprimeThreads(uint64_t ciclos) const
++    {
++        std::fprintf(stderr, "[iop:threads] ciclos=%llu:", static_cast<unsigned long long>(ciclos));
++        for (const auto &[id, th] : m_threads)
++            std::fprintf(stderr, " [%d estado=%d espera=%d pc=0x%x prio=%u entrada=0x%x]", id,
++                         static_cast<int>(th.state), th.waitId, th.cpu.pc, th.priority, th.entry);
++        std::fprintf(stderr, "\n");
++    }
++
+     bool IopKernel::dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         const auto setV0 = [&](int32_t value)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..2bfb114 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -47,6 +47,8 @@ namespace ps2x::iop::detail
+     {
+     public:
+         explicit IopKernel(IopMemory &memory) noexcept;
++        // Otavix: resumo das threads para o log PS2X_LOG_IOP
++        void otxImprimeThreads(uint64_t ciclos) const;
+ 
+         void reset();
+ 
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..d66ecbd 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -17,6 +17,7 @@
+ #include "imports/iop_vblank.h"
+ #include "iop_emulator_const.h"
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <cctype>
+ #include <map>
+@@ -558,6 +559,18 @@ namespace ps2x::iop::detail
+             try
+             {
+                 const uint64_t target = totalCycles + cycles;
++                // Otavix: PS2X_LOG_IOP=1 imprime as threads do IOP a cada ~2 s de IOP
++                static const bool otxLogIop = []
++                {
++                    const char *e = std::getenv("PS2X_LOG_IOP");
++                    return e && e[0] == '1';
++                }();
++                static uint64_t otxProxLog = 0;
++                if (otxLogIop && totalCycles >= otxProxLog)
++                {
++                    otxProxLog = totalCycles + 73728000ull;
++                    kernel.otxImprimeThreads(totalCycles);
++                }
+                 while (totalCycles < target)
+                 {
+                     servicePendingDmaInterrupts();
+@@ -753,6 +766,11 @@ namespace ps2x::iop::detail
+         return m_impl->rpc.handleRpc(request, *m_impl);
+     }
+ 
++    bool IopEmulator::deliverEeSifCommand(uint32_t cid, const void *packet, uint32_t size)
++    {
++        return m_impl->rpc.deliverEeCommand(cid, static_cast<const uint8_t *>(packet), size, *m_impl);
++    }
++
+     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept
+     {
+         return m_impl->rpc.hasServer(sid);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 01b48df..22f0616 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -27,6 +27,7 @@ namespace ps2x::iop::detail
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
++        [[nodiscard]] bool deliverEeSifCommand(uint32_t cid, const void *packet, uint32_t size);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..6f3d803 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
+ #include <cstring>
+ #include <limits>
+ #include <vector>
+@@ -21,6 +22,8 @@ namespace ps2x::iop::detail
+     void IopRpcBridge::reset()
+     {
+         m_servers.clear();
++        m_cmdHandlers.clear();
++        m_cmdPacket = 0u;
+         m_nextDmaId = 1u;
+         m_sifInitialized = false;
+     }
+@@ -145,13 +148,20 @@ namespace ps2x::iop::detail
+         case 7:
+         case 8:
+         case 9:
+-        case 10:
+-        case 11:
+         case 14: // InitRpc
+         case 15:
+         case 16:
+             setV0(0);
+             return true;
++        case 10: // sceSifAddCmdHandler(cid, função, dado): o EE manda comandos para ela
++            m_cmdHandlers[cpu.gpr[4]] = CmdHandler{cpu.gpr[5], cpu.gpr[6], cpu.gpr[28]};
++            std::fprintf(stderr, "[sifcmd:iop] tratador cid=0x%x funcao=0x%x dado=0x%x\n", cpu.gpr[4], cpu.gpr[5], cpu.gpr[6]);
++            setV0(0);
++            return true;
++        case 11: // sceSifRemoveCmdHandler(cid)
++            m_cmdHandlers.erase(cpu.gpr[4]);
++            setV0(0);
++            return true;
+         case 12: // sceSifSendCmd
+         case 13: // isceSifSendCmd
+         {
+@@ -160,6 +170,12 @@ namespace ps2x::iop::detail
+             const uint32_t commandId = cpu.gpr[4];
+             const uint32_t packetAddress = cpu.gpr[5];
+             const uint32_t packetSize = cpu.gpr[6];
++            static int otxLogsEnvio = 0;
++            if (otxLogsEnvio < 24)
++            {
++                ++otxLogsEnvio;
++                std::fprintf(stderr, "[sifcmd:iop:envia] cid=0x%x pacote=0x%x/%u ordinal=%u\n", commandId, packetAddress, packetSize, ordinal);
++            }
+             const uint32_t extraSource = cpu.gpr[7];
+             const uint32_t stackPointer = cpu.gpr[29];
+             const uint32_t extraDestination = m_memory.read32(stackPointer + 16u);
+@@ -273,6 +289,23 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    // Otavix: comandos SIF do EE. O pacote vai para um buffer próprio na RAM do IOP e o tratador do IRX
++    // roda na hora (como na interrupção do SIF); ele costuma só enfileirar e acordar uma thread do IOP.
++    bool IopRpcBridge::deliverEeCommand(uint32_t cid, const uint8_t *packet, uint32_t size, IopGuestExecutor &executor)
++    {
++        constexpr uint32_t kMaxPacket = 128u;
++        const auto it = m_cmdHandlers.find(cid);
++        if (it == m_cmdHandlers.end() || it->second.function == 0u || packet == nullptr || size == 0u)
++            return false;
++        if (m_cmdPacket == 0u)
++            m_cmdPacket = m_memory.allocate(kMaxPacket, 16u);
++        if (m_cmdPacket == 0u)
++            return false;
++        (void)m_memory.writeRam(m_cmdPacket, packet, std::min<uint32_t>(size, kMaxPacket));
++        (void)executor.executeGuestFunction(it->second.function, m_cmdPacket, it->second.data, 0u, 0u, it->second.gp);
++        return true;
++    }
++
+     RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor)
+     {
+         RpcResult result{};
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index a4286ba..f21f1ac 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -49,6 +49,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
++        // Otavix: comandos SIF do EE para o tratador que um IRX registrou (sceSifAddCmdHandler do IOP)
++        [[nodiscard]] bool deliverEeCommand(uint32_t cid, const uint8_t *packet, uint32_t size, IopGuestExecutor &executor);
+         void onSifTransfer(const SifTransfer &transfer);
+         void removeServersInRange(uint32_t base, uint32_t size);
+ 
+@@ -72,6 +74,14 @@ namespace ps2x::iop::detail
+         IopMemory &m_memory;
+         IopKernel &m_kernel;
+         std::unordered_map<uint32_t, RpcServer> m_servers;
++        struct CmdHandler
++        {
++            uint32_t function = 0;
++            uint32_t data = 0;
++            uint32_t gp = 0;
++        };
++        std::unordered_map<uint32_t, CmdHandler> m_cmdHandlers;
++        uint32_t m_cmdPacket = 0u;
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
+     };
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..b6de570 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -194,6 +194,11 @@ namespace ps2x::iop
+         return m_impl->emulator.hasRpcServer(sid);
+     }
+ 
++    bool IopSubsystem::deliverEeSifCommand(uint32_t cid, const void *packet, uint32_t size)
++    {
++        return m_impl->emulator.deliverEeSifCommand(cid, packet, size);
++    }
++
+     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
+     {
+         const auto route = m_impl->routes.find(request.sid);
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..e5a52ac 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -577,6 +577,15 @@ if(MSVC)
+     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+ endif()
+ 
++# Otavix: o código traduzido tem funções enormes com quadros de pilha de mais de 1 MB e todas as
++# threads do jogo rodam na GameThread, que herda a pilha do exe; 256 MB só de reserva (a memória
++# só é usada quando a pilha cresce)
++if(MSVC)
++    target_link_options(ps2EntryRunner PRIVATE "/STACK:268435456")
++elseif(MINGW)
++    target_link_options(ps2EntryRunner PRIVATE "-Wl,--stack,268435456")
++endif()
++
+ # Vita: Work around for GCC 10's LTO plugin
+ if(PS2X_IS_VITA)
+     target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
+diff --git a/ps2xRuntime/include/ps2_call_list.h b/ps2xRuntime/include/ps2_call_list.h
+index 94a6fa1..0070180 100644
+--- a/ps2xRuntime/include/ps2_call_list.h
++++ b/ps2xRuntime/include/ps2_call_list.h
+@@ -305,6 +305,7 @@
+     X(sceCdRead)                              \
+     X(sceCdReadChain)                         \
+     X(sceCdReadClock)                         \
++    X(sceCdReadDvdDualInfo)                   \
+     X(sceCdReadIOPm)                          \
+     X(sceCdSearchFile)                        \
+     X(sceCdSeek)                              \
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..b1467d6 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -298,6 +298,8 @@ public:
+     bool freeIopMemory(uint32_t address);
+     bool readIopMemory(uint32_t address, void *destination, size_t size) const;
+     bool writeIopMemory(uint32_t address, const void *source, size_t size);
++    // Otavix: entrega um comando SIF do EE ao tratador registrado por um IRX no IOP emulado
++    bool deliverIopSifCommand(uint32_t cid, const void *packet, uint32_t size);
+     bool zeroIopMemory(uint32_t address, size_t size);
+     bool isIopMemoryRange(uint32_t address, size_t size) const;
+ 
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 67c8184..ae2b4cc 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -225,6 +225,10 @@ private:
+     std::array<uint64_t, 4> m_accLatestWrite{};
+ 
+     uint64_t m_cycle = 0;
++    // Otavix: menor readyCycle pendente nos pipelines (commitReadyPipelines não varre antes dele)
++    // e par decodificado fora do cache (getDecodedInstructionPairForPc devolve referência)
++    uint64_t m_otxProxCommit = 0;
++    DecodedInstructionPair m_otxDecodedTemp{};
+     uint64_t m_nextWriteSequence = 0;
+     uint64_t m_efuResourceReady = 0;
+     uint32_t m_workingClip = 0;
+@@ -250,7 +254,7 @@ private:
+     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
+     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
+     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
+-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
++    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+ 
+     void execUpper(uint32_t instr);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..a498c78 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -5,7 +5,10 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
++#include <chrono>
+ #include <cstring>
++#include <iostream>
+ #include <limits>
+ #include <stdexcept>
+ 
+@@ -246,6 +249,34 @@ void EeScheduler::run()
+                 }
+                 continue;
+             }
++            if (running->id > 0)
++            {
++                // Otavix: a thread acabou por retornar para o endereço 0 (sem Exit/ExitThread): registra
++                // sp/ra e os endereços de código que ainda estão na pilha (quadros recém-desempilhados
++                // continuam na memória), para achar onde ela morreu
++                const uint32_t sp = getRegU32(&context, 29);
++                std::cout << "[thread:fim] id=" << running->id << " sp=0x" << std::hex << sp << " ra=0x" << getRegU32(&context, 31)
++                          << " pilha:";
++                int mostrados = 0;
++                for (uint32_t a = (sp - 0x400u) & ~3u; a < sp + 0x100u && mostrados < 40; a += 4u)
++                {
++                    const uint32_t f = a & 0x1FFFFFFu;
++                    if (!m_rdram || f + 4u > PS2_RAM_SIZE)
++                        break;
++                    uint32_t v = 0;
++                    std::memcpy(&v, m_rdram + f, 4u);
++                    uint32_t ins = 0;
++                    if (v >= 0x100008u && v < 0x01000000u && (v & 3u) == 0u)
++                        std::memcpy(&ins, m_rdram + ((v - 8u) & 0x1FFFFFFu), 4u);
++                    // endereço de retorno: a instrução 8 bytes antes é um jal (op 3) ou jalr (funct 9)
++                    if (v >= 0x100008u && ((ins >> 26) == 3u || ((ins >> 26) == 0u && (ins & 0x3Fu) == 9u)))
++                    {
++                        std::cout << " [" << (a - sp) << "]=" << v;
++                        ++mostrados;
++                    }
++                }
++                std::cout << std::dec << std::endl;
++            }
+             makeDormant(*running);
+             m_currentThreadId = 0;
+             copyMainContextToRuntime();
+@@ -254,7 +285,33 @@ void EeScheduler::run()
+             continue;
+         }
+ 
+-        if (!m_pendingInvocations.empty() && running->invocations.empty())
++        // Otavix: interrupções (e alarmes/callback de VSync, que chegam por interrupção) só entram
++        // com o EIE do Status ligado, como no EE real; com di ativo ficam pendentes até o ei
++        static const bool diAntigo = std::getenv("PS2X_DI_ANTIGO") != nullptr;
++        const bool interrupcaoBloqueada =
++            !diAntigo && !m_pendingInvocations.empty() &&
++            (m_pendingInvocations.front().kind == GuestInvocationKind::Interrupt ||
++             m_pendingInvocations.front().kind == GuestInvocationKind::Alarm ||
++             m_pendingInvocations.front().kind == GuestInvocationKind::GsCallback) &&
++            (context.cop0_status & 0x10000u) == 0u;
++        static const bool diagDi = std::getenv("PS2X_TICK") != nullptr;
++        if (diagDi && interrupcaoBloqueada && running->invocations.empty())
++        {
++            // Otavix (diagnóstico): onde a thread está quando segura interrupções com di
++            static auto ultimo = std::chrono::steady_clock::now();
++            static uint64_t vezes = 0;
++            ++vezes;
++            const auto agora = std::chrono::steady_clock::now();
++            if (agora - ultimo > std::chrono::seconds(2))
++            {
++                ultimo = agora;
++                std::cout << "[di] interrupção segurada " << vezes << "x; agora thread=" << running->id << " pc=0x" << std::hex
++                          << context.pc << " ra=0x" << getRegU32(&context, 31) << " status=0x" << context.cop0_status << std::dec
++                          << " pendentes=" << m_pendingInvocations.size() << std::endl;
++                vezes = 0;
++            }
++        }
++        if (!m_pendingInvocations.empty() && running->invocations.empty() && !interrupcaoBloqueada)
+         {
+             GuestInvocation invocation = std::move(m_pendingInvocations.front());
+             m_pendingInvocations.pop_front();
+diff --git a/ps2xRuntime/src/lib/Kernel/OtavixArena.cpp b/ps2xRuntime/src/lib/Kernel/OtavixArena.cpp
+new file mode 100644
+index 0000000..d490928
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/OtavixArena.cpp
+@@ -0,0 +1,81 @@
++#include "OtavixArena.h"
++#include "ps2_runtime.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++
++namespace otx
++{
++    namespace
++    {
++        constexpr uint32_t kArenaBase = 0x00040000u;
++        constexpr uint32_t kArenaFim = 0x00070000u; // remendos de kernel da SDK usam 0x75000
++
++        std::mutex g_arenaMutex;
++        std::map<uint32_t, uint32_t> g_arenaUsados; // início -> tamanho
++
++        bool arenaLigada()
++        {
++            static const bool ligada = []
++            {
++                const char *e = std::getenv("PS2X_ARENA");
++                return !(e && e[0] == '0');
++            }();
++            return ligada;
++        }
++
++        uint32_t alinha(uint32_t valor, uint32_t alinhamento)
++        {
++            return (valor + alinhamento - 1u) & ~(alinhamento - 1u);
++        }
++    }
++
++    uint32_t alocaInterno(PS2Runtime *runtime, uint32_t tamanho, uint32_t alinhamento)
++    {
++        if (arenaLigada())
++        {
++            if (tamanho == 0u)
++            {
++                tamanho = 1u;
++            }
++            if (alinhamento < 16u || (alinhamento & (alinhamento - 1u)) != 0u)
++            {
++                alinhamento = 16u;
++            }
++            std::lock_guard<std::mutex> lock(g_arenaMutex);
++            uint32_t candidato = kArenaBase;
++            for (const auto &[inicio, usado] : g_arenaUsados)
++            {
++                candidato = alinha(candidato, alinhamento);
++                if (candidato + tamanho <= inicio)
++                {
++                    break;
++                }
++                candidato = std::max(candidato, inicio + usado);
++            }
++            candidato = alinha(candidato, alinhamento);
++            if (candidato + tamanho <= kArenaFim)
++            {
++                g_arenaUsados[candidato] = tamanho;
++                return candidato;
++            }
++        }
++        return runtime ? runtime->guestMalloc(tamanho, alinhamento) : 0u;
++    }
++
++    void liberaInterno(PS2Runtime *runtime, uint32_t endereco)
++    {
++        if (endereco >= kArenaBase && endereco < kArenaFim)
++        {
++            std::lock_guard<std::mutex> lock(g_arenaMutex);
++            g_arenaUsados.erase(endereco);
++            return;
++        }
++        if (runtime && endereco != 0u)
++        {
++            runtime->guestFree(endereco);
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/OtavixArena.h b/ps2xRuntime/src/lib/Kernel/OtavixArena.h
+new file mode 100644
+index 0000000..5a6868c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/OtavixArena.h
+@@ -0,0 +1,15 @@
++#pragma once
++// Otavix: arena para os pacotes e buffers internos do runtime (GS, fonte, SIF, MPEG).
++// O guestMalloc começa logo depois do ELF, que é onde o jogo monta o próprio heap quando não usa o
++// malloc da libc: o Ghost Rider perdia uma lista porque o sceGsResetGraph montava o pacote GIF em
++// cima dela. A arena fica em 0x40000-0x70000, memória do kernel no PS2 que os jogos não usam; cheia,
++// cai no guestMalloc. PS2X_ARENA=0 desliga (tudo no guestMalloc, como antes).
++#include <cstdint>
++
++class PS2Runtime;
++
++namespace otx
++{
++    uint32_t alocaInterno(PS2Runtime *runtime, uint32_t tamanho, uint32_t alinhamento = 16u);
++    void liberaInterno(PS2Runtime *runtime, uint32_t endereco);
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/OtavixVigia.cpp b/ps2xRuntime/src/lib/Kernel/OtavixVigia.cpp
+new file mode 100644
+index 0000000..019a3e6
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/OtavixVigia.cpp
+@@ -0,0 +1,89 @@
++// Otavix: vigia de escrita na RAM do EE (diagnóstico), num arquivo próprio porque precisa do
++// windows.h, que conflita com o raylib incluído pelo ps2_runtime.cpp.
++// PS2X_VIGIA=<endereço hex>,<bytes>: a página da RAM vira só leitura; cada escrita na faixa é
++// registrada com o PC/RA do EE ([vigia] ...) e a instrução segue (passo único e reproteção).
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#endif
++
++namespace otx
++{
++    using PegaPc = void (*)(uint32_t &pc, uint32_t &ra);
++
++    namespace
++    {
++        uint8_t *g_rdram = nullptr;
++        PegaPc g_pegaPc = nullptr;
++        uint32_t g_ini = 0u, g_len = 0u;
++        uintptr_t g_pagIni = 0u, g_pagFim = 0u;
++        std::atomic<int> g_hits{0};
++        thread_local bool t_reproteger = false;
++
++#ifdef _WIN32
++        LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
++        {
++            EXCEPTION_RECORD *er = ep->ExceptionRecord;
++            if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2 &&
++                er->ExceptionInformation[0] == 1)
++            {
++                const uintptr_t a = er->ExceptionInformation[1];
++                if (a >= g_pagIni && a < g_pagFim)
++                {
++                    const uint32_t guest = static_cast<uint32_t>(a - reinterpret_cast<uintptr_t>(g_rdram));
++                    if (guest >= g_ini && guest < g_ini + g_len && g_hits.fetch_add(1) < 400)
++                    {
++                        uint32_t pc = 0u, ra = 0u;
++                        if (g_pegaPc)
++                            g_pegaPc(pc, ra);
++                        std::printf("[vigia] escrita em 0x%08X pc=0x%08X ra=0x%08X thread=%lu\n", guest, pc, ra,
++                                    static_cast<unsigned long>(GetCurrentThreadId()));
++                        std::fflush(stdout);
++                    }
++                    DWORD velho = 0;
++                    VirtualProtect(reinterpret_cast<void *>(g_pagIni), g_pagFim - g_pagIni, PAGE_READWRITE, &velho);
++                    ep->ContextRecord->EFlags |= 0x100u;
++                    t_reproteger = true;
++                    return EXCEPTION_CONTINUE_EXECUTION;
++                }
++            }
++            if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && t_reproteger)
++            {
++                t_reproteger = false;
++                DWORD velho = 0;
++                VirtualProtect(reinterpret_cast<void *>(g_pagIni), g_pagFim - g_pagIni, PAGE_READONLY, &velho);
++                return EXCEPTION_CONTINUE_EXECUTION;
++            }
++            return EXCEPTION_CONTINUE_SEARCH;
++        }
++#endif
++    }
++
++    void vigiaIniciar(uint8_t *rdram, PegaPc pegaPc)
++    {
++        const char *s = std::getenv("PS2X_VIGIA");
++        if (!s || !*s || !rdram)
++            return;
++        g_rdram = rdram;
++        g_pegaPc = pegaPc;
++        g_ini = static_cast<uint32_t>(std::strtoul(s, nullptr, 16)) & 0x1FFFFFFu;
++        const char *v = std::strchr(s, ',');
++        g_len = v ? static_cast<uint32_t>(std::strtoul(v + 1, nullptr, 0)) : 4u;
++#ifdef _WIN32
++        const uintptr_t base = reinterpret_cast<uintptr_t>(rdram);
++        g_pagIni = (base + g_ini) & ~static_cast<uintptr_t>(0xFFFu);
++        g_pagFim = (base + g_ini + g_len + 0xFFFu) & ~static_cast<uintptr_t>(0xFFFu);
++        AddVectoredExceptionHandler(1, veh);
++        DWORD velho = 0;
++        VirtualProtect(reinterpret_cast<void *>(g_pagIni), g_pagFim - g_pagIni, PAGE_READONLY, &velho);
++        std::printf("[vigia] vigiando 0x%08X +%u\n", g_ini, g_len);
++        std::fflush(stdout);
++#endif
++    }
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+index e1be7d2..2ad7dd3 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+@@ -205,9 +205,31 @@ namespace ps2_stubs
+         setReturnS32(ctx, 0);
+     }
+ 
++    // sceSdTransToIOP(void *buff, u32 sendAddr, u32 size, u32 isBlock): a libsdr do EE manda
++    // dados (amostras de som) para a memória do IOP, onde o driver de som os usa. Copia direto,
++    // como o sceSifSetDma, e devolve 0 (transferência concluída).
+     void sceSdTransToIOP(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        TODO_NAMED("sceSdTransToIOP", rdram, ctx, runtime);
++        const uint32_t src = getRegU32(ctx, 4);
++        const uint32_t dst = getRegU32(ctx, 5);
++        const uint32_t size = getRegU32(ctx, 6);
++        int32_t ret = 0;
++        if (size != 0u)
++        {
++            std::vector<uint8_t> payload(size);
++            const uint8_t *from = getConstMemPtr(rdram, src);
++            if (!runtime || !from || size > PS2_RAM_SIZE || !runtime->isIopMemoryRange(dst, size))
++            {
++                ret = -1;
++            }
++            else
++            {
++                std::memcpy(payload.data(), from, size);
++                if (!runtime->writeIopMemory(dst, payload.data(), payload.size()))
++                    ret = -1;
++            }
++        }
++        setReturnS32(ctx, ret);
+     }
+ 
+     void sceSSyn_BreakAtick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..3882419 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -2,6 +2,8 @@
+ #include "CD.h"
+ #include "MPEG.h"
+ #include "runtime/ee_scheduler.h"
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace ps2_stubs
+ {
+@@ -31,6 +33,63 @@ namespace ps2_stubs
+         uint32_t g_cdStReadTraceCount = 0u;
+         CdStreamTimingState g_cdStreamTiming;
+ 
++        // Otavix: função registrada pelo sceCdCallback. A libcdvd a chama quando um comando N termina
++        // (a0 = código do comando: 1 leitura, 3 toc, 4 seek, 5 standby, 6 stop, 7 pause); aqui os
++        // comandos terminam na hora, então ela entra como invocação pendente logo depois do stub.
++        // PS2X_CD_CALLBACK=0 volta ao comportamento antigo (nunca chama).
++        uint32_t g_cdCallbackFunc = 0u;
++
++        // Otavix: PS2X_LOG_CD=<n> registra as n primeiras leituras e chamadas do callback
++        int &otxLogCdRestantes()
++        {
++            static int restantes = []
++            {
++                const char *e = std::getenv("PS2X_LOG_CD");
++                return e ? std::atoi(e) : 0;
++            }();
++            return restantes;
++        }
++
++        void otxLogCdRead(uint8_t *rdram, R5900Context *ctx, const char *qual, uint32_t lbn, uint32_t setores, uint32_t destino)
++        {
++            int &restantes = otxLogCdRestantes();
++            if (restantes <= 0)
++                return;
++            --restantes;
++            const uint8_t *p = rdram + (destino & PS2_RAM_MASK);
++            char bytes[48] = {};
++            std::snprintf(bytes, sizeof(bytes), "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
++                          p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
++            std::cerr << "[cd:" << qual << "] lbn=" << lbn << " setores=" << setores << " destino=0x" << std::hex << destino
++                      << " ra=0x" << getRegU32(ctx, 31) << std::dec << " bytes=" << bytes << std::endl;
++        }
++
++        void cdAvisaCallback(PS2Runtime *runtime, uint32_t comando)
++        {
++            static const bool desligado = [] { const char *e = std::getenv("PS2X_CD_CALLBACK"); return e && e[0] == '0'; }();
++            if (desligado || runtime == nullptr || g_cdCallbackFunc == 0u)
++            {
++                return;
++            }
++            if (otxLogCdRestantes() > 0)
++                std::cerr << "[cd:callback] comando=" << comando << " funcao=0x" << std::hex << g_cdCallbackFunc << std::dec << std::endl;
++            try
++            {
++                GuestInvocation invocation{};
++                invocation.kind = GuestInvocationKind::RpcCallback;
++                invocation.tag = 0xCD000000u | comando;
++                invocation.context = runtime->cpu();
++                invocation.context.pc = g_cdCallbackFunc;
++                SET_GPR_U32(&invocation.context, 4, comando);
++                SET_GPR_U32(&invocation.context, 29, 0u);
++                SET_GPR_U32(&invocation.context, 31, 0u);
++                runtime->eeScheduler().queueInvocation(std::move(invocation));
++            }
++            catch (...)
++            {
++            }
++        }
++
+         uint64_t currentCdStreamTick(PS2Runtime *runtime)
+         {
+             return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
+@@ -317,6 +376,8 @@ namespace ps2_stubs
+         {
+             g_cdStreamingLbn = selected.lbn + selected.sectors;
+             setReturnS32(ctx, 1); // command accepted/success
++            otxLogCdRead(rdram, ctx, "read", selected.lbn, selected.sectors, selected.buf);
++            cdAvisaCallback(runtime, 1u);
+             return;
+         }
+ 
+@@ -355,7 +416,10 @@ namespace ps2_stubs
+ 
+     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        setReturnS32(ctx, 0);
++        // devolve a função anterior, como a libcdvd
++        const uint32_t anterior = g_cdCallbackFunc;
++        g_cdCallbackFunc = getRegU32(ctx, 4);
++        setReturnS32(ctx, static_cast<int32_t>(anterior));
+     }
+ 
+     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -392,6 +456,7 @@ namespace ps2_stubs
+             std::memset(toc, 0, 1024);
+         }
+         setReturnS32(ctx, 1);
++        cdAvisaCallback(runtime, 3u);
+     }
+ 
+     void sceCdInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -445,6 +510,7 @@ namespace ps2_stubs
+     void sceCdPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         setReturnS32(ctx, 1);
++        cdAvisaCallback(runtime, 7u);
+     }
+ 
+     void sceCdPosToInt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -505,6 +571,10 @@ namespace ps2_stubs
+         }
+ 
+         setReturnS32(ctx, ok ? 1 : 0);
++        if (ok)
++        {
++            cdAvisaCallback(runtime, 1u);
++        }
+     }
+ 
+     void sceCdReadClock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -537,6 +607,23 @@ namespace ps2_stubs
+         setReturnS32(ctx, 1);
+     }
+ 
++    // Otavix: int sceCdReadDvdDualInfo(int *on_dual, u32 *layer1_start) — DVD de uma camada
++    void sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        (void)runtime;
++        if (uint8_t *p = getMemPtr(rdram, getRegU32(ctx, 4)))
++        {
++            const int32_t zero = 0;
++            std::memcpy(p, &zero, sizeof(zero));
++        }
++        if (uint8_t *p = getMemPtr(rdram, getRegU32(ctx, 5)))
++        {
++            const uint32_t zero = 0u;
++            std::memcpy(p, &zero, sizeof(zero));
++        }
++        setReturnS32(ctx, 1);
++    }
++
+     void sceCdReadIOPm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         sceCdRead(rdram, ctx, runtime);
+@@ -652,11 +739,13 @@ namespace ps2_stubs
+     {
+         restartCdStreamAt(getRegU32(ctx, 4), runtime);
+         setReturnS32(ctx, 1);
++        cdAvisaCallback(runtime, 4u);
+     }
+ 
+     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         setReturnS32(ctx, 1);
++        cdAvisaCallback(runtime, 5u);
+     }
+ 
+     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -689,6 +778,7 @@ namespace ps2_stubs
+     void sceCdStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         setReturnS32(ctx, 1);
++        cdAvisaCallback(runtime, 6u);
+     }
+ 
+     void sceCdStPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.h b/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+index dd5bae9..b35fc80 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+@@ -63,6 +63,7 @@ namespace ps2_stubs
+     void sceCdPosToInt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdReadChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdReadClock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++    void sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdReadIOPm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Font.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Font.cpp
+index 41e4387..edd6c3f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Font.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Font.cpp
+@@ -1,4 +1,5 @@
+ #include "Common.h"
++#include "../OtavixArena.h"
+ #include "Font.h"
+ 
+ namespace ps2_stubs
+@@ -41,7 +42,7 @@ namespace ps2_stubs
+                 constexpr uint32_t kClutQwc = 4u;
+                 constexpr uint32_t kHeaderQwc = 6u;
+                 constexpr uint32_t kTotalQwc = kHeaderQwc + kClutQwc;
+-                uint32_t pktAddr = runtime->guestMalloc(kTotalQwc * 16u, 16u);
++                uint32_t pktAddr = otx::alocaInterno(runtime, kTotalQwc * 16u, 16u);
+                 if (pktAddr != 0u)
+                 {
+                     uint8_t *pkt = getMemPtr(rdram, pktAddr);
+@@ -122,7 +123,7 @@ namespace ps2_stubs
+         int qwc = (fontDataSz >= 0) ? (fontDataSz >> 4) : ((fontDataSz + 0xf) >> 4);
+ 
+         uint32_t glyphSrc = fontDataAddr + static_cast<uint32_t>(fontDataSz) + 0x10u;
+-        uint32_t glyphAlloc = runtime->guestMalloc(0x2010u, 0x40u);
++        uint32_t glyphAlloc = otx::alocaInterno(runtime, 0x2010u, 0x40u);
+         if (uint8_t *p = getMemPtr(rdram, kFontBase + fontOff))
+             *reinterpret_cast<uint32_t *>(p) = glyphAlloc;
+ 
+@@ -140,7 +141,7 @@ namespace ps2_stubs
+         if (isDoubleByte == 0u)
+         {
+             uint32_t kernSrc = glyphSrc + 0x2010u;
+-            uint32_t kernAlloc = runtime->guestMalloc(0xc400u, 0x40u);
++            uint32_t kernAlloc = otx::alocaInterno(runtime, 0xc400u, 0x40u);
+             if (glyphAlloc != 0u)
+                 *reinterpret_cast<uint32_t *>(getMemPtr(rdram, glyphAlloc + 0x2000u)) = kernAlloc;
+             if (kernAlloc != 0u)
+@@ -180,7 +181,7 @@ namespace ps2_stubs
+             const uint32_t headerQwc = 12u;
+             const uint32_t imageQwc = static_cast<uint32_t>(qwc);
+             const uint32_t totalQwc = headerQwc + imageQwc;
+-            uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
++            uint32_t pktAddr = otx::alocaInterno(runtime, totalQwc * 16u, 16u);
+             if (pktAddr != 0u)
+             {
+                 uint8_t *pkt = getMemPtr(rdram, pktAddr);
+@@ -623,8 +624,8 @@ namespace ps2_stubs
+                 if (const uint8_t *kp = getConstMemPtr(rdram, glyphPtr + 0x2000u))
+                     kernPtr = *reinterpret_cast<const uint32_t *>(kp);
+                 if (kernPtr != 0u)
+-                    runtime->guestFree(kernPtr);
+-                runtime->guestFree(glyphPtr);
++                    otx::liberaInterno(runtime, kernPtr);
++                otx::liberaInterno(runtime, glyphPtr);
+             }
+             if (uint8_t *p = getMemPtr(rdram, kFontBase + fontOff))
+                 *reinterpret_cast<uint32_t *>(p) = 0u;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index aed4cb5..6a7fbf7 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -1,4 +1,5 @@
+ #include "Common.h"
++#include "../OtavixArena.h"
+ #include "GS.h"
+ #include "ps2_log.h"
+ #include "runtime/gs/ps2_gs_common.h"
+@@ -615,7 +616,7 @@ namespace ps2_stubs
+         const uint32_t imageQwc = (totalImageBytes + 15u) / 16u;
+         const uint32_t totalQwc = headerQwc + imageQwc;
+ 
+-        uint32_t pktAddr = runtime->guestMalloc(totalQwc * 16u, 16u);
++        uint32_t pktAddr = otx::alocaInterno(runtime, totalQwc * 16u, 16u);
+         if (pktAddr == 0)
+         {
+             setReturnS32(ctx, -1);
+@@ -626,7 +627,7 @@ namespace ps2_stubs
+         const uint8_t *src = getConstMemPtr(rdram, srcAddr);
+         if (!pkt || !src)
+         {
+-            runtime->guestFree(pktAddr);
++            otx::liberaInterno(runtime, pktAddr);
+             setReturnS32(ctx, -1);
+             return;
+         }
+@@ -662,7 +663,7 @@ namespace ps2_stubs
+         mem.writeIORegister(GIF_CHANNEL + 0x20u, totalQwc & 0xFFFFu);
+         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+         mem.processPendingTransfers();
+-        runtime->guestFree(pktAddr);
++        otx::liberaInterno(runtime, pktAddr);
+ 
+         setReturnS32(ctx, 0);
+     }
+@@ -709,7 +710,7 @@ namespace ps2_stubs
+                           (static_cast<uint64_t>(0u) << 48);
+         uint64_t trxreg = static_cast<uint64_t>(img.height) << 32 | static_cast<uint64_t>(img.width);
+ 
+-        uint32_t pktAddr = runtime->guestMalloc(80u, 16u);
++        uint32_t pktAddr = otx::alocaInterno(runtime, 80u, 16u);
+         if (pktAddr == 0)
+         {
+             setReturnS32(ctx, -1);
+@@ -719,7 +720,7 @@ namespace ps2_stubs
+         uint8_t *pkt = getMemPtr(rdram, pktAddr);
+         if (!pkt)
+         {
+-            runtime->guestFree(pktAddr);
++            otx::liberaInterno(runtime, pktAddr);
+             setReturnS32(ctx, -1);
+             return;
+         }
+@@ -746,7 +747,7 @@ namespace ps2_stubs
+ 
+         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
+         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+-        runtime->guestFree(pktAddr);
++        otx::liberaInterno(runtime, pktAddr);
+ 
+         setReturnS32(ctx, 0);
+     }
+@@ -779,6 +780,14 @@ namespace ps2_stubs
+             setReturnS32(ctx, -1);
+             return;
+         }
++        if (otxJanelaLog())
++        {
++            std::cout << "[putdraw] env=0x" << std::hex << envAddr << std::dec;
++            for (int i = 0; i < 8; ++i)
++                if ((pairs[i].reg & 0xFFu) == 0x4Cu || (pairs[i].reg & 0xFFu) == 0x4Du)
++                    std::cout << " frame(0x" << std::hex << (pairs[i].reg & 0xFFu) << std::dec << ").fbp=" << (pairs[i].value & 0x1FFu);
++            std::cout << " desenho=" << g_otxPrimSeq.load() << std::endl;
++        }
+         applyGsRegPairs(runtime, pairs, 8u);
+         setReturnS32(ctx, 0);
+     }
+@@ -810,7 +819,7 @@ namespace ps2_stubs
+ 
+             if (runtime)
+             {
+-                uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
++                uint32_t pktAddr = otx::alocaInterno(runtime, 128u, 16u);
+                 if (pktAddr != 0u)
+                 {
+                     uint8_t *pkt = getMemPtr(rdram, pktAddr);
+@@ -840,11 +849,11 @@ namespace ps2_stubs
+                         mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
+                         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+                         mem.processPendingTransfers();
+-                        runtime->guestFree(pktAddr);
++                        otx::liberaInterno(runtime, pktAddr);
+                     }
+                     else
+                     {
+-                        runtime->guestFree(pktAddr);
++                        otx::liberaInterno(runtime, pktAddr);
+                     }
+                 }
+             }
+@@ -943,9 +952,11 @@ namespace ps2_stubs
+         uint32_t psm = getRegU32(ctx, 5);
+         uint32_t w = getRegU32(ctx, 6);
+         uint32_t h = getRegU32(ctx, 7);
+-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
+-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
+-        const uint32_t clear = readStackU32(rdram, ctx, 24);
++        // Otavix: no EABI do EE o 5º-7º argumentos vêm em t0-t2 (antes lia da pilha e o ztest/zpsm saíam errados)
++        const GsTrailingArgs3 extras = decodeGsTrailingArgs3(rdram, ctx);
++        const uint32_t ztest = extras.arg0;
++        const uint32_t zpsm = extras.arg1;
++        const uint32_t clear = extras.arg2;
+         (void)clear;
+ 
+         if (w == 0u)
+@@ -1198,6 +1209,23 @@ namespace ps2_stubs
+             return;
+         }
+ 
++        {
++            // Otavix (diagnóstico): as 6 primeiras trocas, com o buffer exibido e o de desenho
++            static int nLog = 0;
++            if (otxJanelaLog())
++            {
++                ++nLog;
++                auto framePar = [](const GsRegPairMem *p) -> long long {
++                    for (int i = 0; i < 8; ++i)
++                        if ((p[i].reg & 0xFFu) == 0x4Cu || (p[i].reg & 0xFFu) == 0x4Du) return static_cast<long long>(p[i].value & 0x1FFu);
++                    return -1;
++                };
++                std::cout << "[swapdbuff] which=" << which
++                          << " disp0.fbp=" << (db.disp[0].dispfb & 0x1FFu) << " disp1.fbp=" << (db.disp[1].dispfb & 0x1FFu)
++                          << " draw0.fbp=" << framePar(reinterpret_cast<const GsRegPairMem *>(&db.draw0))
++                          << " draw1.fbp=" << framePar(reinterpret_cast<const GsRegPairMem *>(&db.draw1)) << std::endl;
++            }
++        }
+         applyGsDispEnv(runtime, db.disp[which]);
+         if (which == 0u)
+         {
+@@ -1280,6 +1308,8 @@ namespace ps2_stubs
+ 
+     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        if (otxJanelaLog())
++            std::cout << "[syncv] ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << " desenho=" << g_otxPrimSeq.load() << std::endl;
+         ps2_syscalls::WaitVSyncTick(rdram,
+                                     ctx,
+                                     runtime,
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..f51180d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1,5 +1,12 @@
+ #include <algorithm>
+ #include <cctype>
++#include <atomic>
++#include <iostream>
++// Otavix: número do desenho do GS (gs_cpu_backend.cpp), para os registros de diagnóstico
++extern std::atomic<uint32_t> g_otxPrimSeq;
++bool otxJanelaLog();
++// Otavix: trocas de buffer exibido (quadros do jogo), para o contador de FPS do [run:tick]
++extern std::atomic<uint32_t> g_otxTrocas;
+ 
+ namespace
+ {
+@@ -1879,6 +1886,17 @@ namespace
+         if (!runtime || !runtime->syncCoreSubsystems())
+             return;
+         auto &regs = runtime->memory().gs();
++        if ((regs.dispfb1 & 0x1FFu) != (env.dispfb & 0x1FFu))
++            g_otxTrocas.fetch_add(1u, std::memory_order_relaxed);
++        {
++            // Otavix (diagnóstico): as 20 primeiras trocas pela exibição emulada
++            static int nLog = 0;
++            if (otxJanelaLog())
++            {
++                ++nLog;
++                std::cout << "[dispfb1:hle] fbp=" << (env.dispfb & 0x1FFu) << " desenho=" << g_otxPrimSeq.load() << std::endl;
++            }
++        }
+         regs.pmode = env.pmode;
+         regs.smode2 = env.smode2;
+         regs.dispfb1 = env.dispfb;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..f2650c5 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1,4 +1,5 @@
+ #include "Common.h"
++#include "../OtavixArena.h"
+ #include "MPEG.h"
+ #include "runtime/ee_scheduler.h"
+ 
+@@ -1590,14 +1591,14 @@ namespace ps2_stubs
+                 return;
+             }
+ 
+-            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++            const uint32_t cbDataAddr = otx::alocaInterno(runtime, kMpegCallbackDataSize, 16u);
+             if (cbDataAddr == 0u)
+             {
+                 return;
+             }
+             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
+             {
+-                runtime->guestFree(cbDataAddr);
++                otx::liberaInterno(runtime, cbDataAddr);
+                 return;
+             }
+ 
+@@ -1615,7 +1616,7 @@ namespace ps2_stubs
+             invocation.context = callbackCtx;
+             invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
+             {
+-                runtime->guestFree(cbDataAddr);
++                otx::liberaInterno(runtime, cbDataAddr);
+             };
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
+         }
+@@ -2014,7 +2015,7 @@ namespace ps2_stubs
+         mpegGuestWrite32(rdram, puVar4 + 0x8, a1_init);
+         mpegGuestWrite32(rdram, puVar4 + 0xC, a1_init);
+ 
+-        const uint32_t allocResult = runtime ? runtime->guestMalloc(0x600, 8u) : (uVar3 + 0x200u);
++        const uint32_t allocResult = runtime ? otx::alocaInterno(runtime, 0x600, 8u) : (uVar3 + 0x200u);
+         mpegGuestWrite32(rdram, uVar3 + 0x44, allocResult);
+ 
+         // param_1[0..2] = 0; param_1[4..0xe] = 0xffffffff/0 as per decompilation
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..2be0798 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -1,4 +1,5 @@
+ #include "Common.h"
++#include "../OtavixArena.h"
+ #include "SIF.h"
+ #include "../Syscalls/RPC.h"
+ #include "../../ps2_iop_transport.h"
+@@ -25,8 +26,17 @@ namespace ps2_stubs
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t srcAddr = getRegU32(ctx, 7); // $a3
+-        const uint32_t dstAddr = readStackU32(rdram, ctx, 16);
+-        const uint32_t size = readStackU32(rdram, ctx, 20);
++        // Otavix: EABI do EE (8 registradores de argumento): destino e tamanho dos extras em t0/t1
++        const uint32_t dstAddr = getRegU32(ctx, 8);
++        const uint32_t size = getRegU32(ctx, 9);
++        static int otxLogsEntrada = 0;
++        if (otxLogsEntrada < 24)
++        {
++            ++otxLogsEntrada;
++            std::cerr << "[sifcmd:ee:entrada] cid=0x" << std::hex << getRegU32(ctx, 4) << " pacote=0x" << getRegU32(ctx, 5)
++                      << "/" << std::dec << getRegU32(ctx, 6) << " extra=0x" << std::hex << srcAddr << "->0x" << dstAddr
++                      << "/" << std::dec << size << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
++        }
+         if (size != 0u && srcAddr != 0u && dstAddr != 0u)
+         {
+             std::vector<uint8_t> payload(size);
+@@ -43,11 +53,47 @@ namespace ps2_stubs
+             }
+             if (!valid || !runtime->writeIopMemory(dstAddr, payload.data(), payload.size()))
+             {
++                std::cerr << "[sifcmd:ee] extras nao copiados para o IOP (0x" << std::hex << dstAddr << std::dec << "/" << size << ")" << std::endl;
+                 setReturnS32(ctx, 0);
+                 return;
+             }
+         }
+ 
++        // Otavix: comandos SIF para o IOP emulado. Depois dos dados extras, o pacote (com o cabeçalho
++        // que o hardware preenche: tamanho | extra << 8, destino do extra, cid) vai para o tratador que
++        // o IRX registrou com o sceSifAddCmdHandler do IOP, se houver.
++        const uint32_t cid = getRegU32(ctx, 4);
++        const uint32_t packetAddr = getRegU32(ctx, 5);
++        const uint32_t packetSize = getRegU32(ctx, 6);
++        if (runtime && packetAddr != 0u && packetSize >= 16u && packetSize <= 112u)
++        {
++            std::vector<uint8_t> packet(packetSize);
++            bool ok = true;
++            for (uint32_t i = 0; i < packetSize && ok; ++i)
++            {
++                const uint8_t *src = getConstMemPtr(rdram, packetAddr + i);
++                ok = src != nullptr;
++                if (ok)
++                    packet[i] = *src;
++            }
++            if (ok)
++            {
++                const uint32_t sizeWord = packetSize | (size << 8);
++                std::memcpy(packet.data() + 0u, &sizeWord, sizeof(sizeWord));
++                std::memcpy(packet.data() + 4u, &dstAddr, sizeof(dstAddr));
++                std::memcpy(packet.data() + 8u, &cid, sizeof(cid));
++                const bool entregue = runtime->deliverIopSifCommand(cid, packet.data(), packetSize);
++                static int otxLogs = 0;
++                if (otxLogs < 24)
++                {
++                    ++otxLogs;
++                    std::cerr << "[sifcmd:ee] cid=0x" << std::hex << cid << " pacote=0x" << packetAddr << "/" << std::dec << packetSize
++                              << " extra=0x" << std::hex << srcAddr << "->0x" << dstAddr << "/" << std::dec << size
++                              << (entregue ? " entregue ao IOP" : " sem tratador no IOP") << std::endl;
++                }
++            }
++        }
++
+         setReturnS32(ctx, 1);
+     }
+ 
+@@ -239,6 +285,15 @@ namespace ps2_stubs
+         {
+             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+             const auto handler = g_sifCmdHandlers.find(commandId);
++            static int otxLogsIopEe = 0;
++            if (otxLogsIopEe < 24)
++            {
++                ++otxLogsIopEe;
++                std::cerr << "[sifcmd:iop->ee] cid=0x" << std::hex << commandId << std::dec << " tamanho=" << packetSize
++                          << (handler == g_sifCmdHandlers.end() ? " sem tratador no EE" : " tratador 0x")
++                          << std::hex << (handler == g_sifCmdHandlers.end() ? 0u : handler->second.function) << std::dec
++                          << " (tratadores: " << g_sifCmdHandlers.size() << ")" << std::endl;
++            }
+             if (handler == g_sifCmdHandlers.end() || handler->second.function == 0u)
+                 return false;
+             registered = handler->second;
+@@ -247,7 +302,7 @@ namespace ps2_stubs
+         if (!runtime->hasFunction(registered.function))
+             return false;
+ 
+-        const uint32_t packetAddress = runtime->guestMalloc(static_cast<uint32_t>(packetSize), 16u);
++        const uint32_t packetAddress = otx::alocaInterno(runtime, static_cast<uint32_t>(packetSize), 16u);
+         if (packetAddress == 0u)
+             return false;
+ 
+@@ -255,7 +310,7 @@ namespace ps2_stubs
+         uint8_t *const last = getMemPtr(rdram, packetAddress + static_cast<uint32_t>(packetSize - 1u));
+         if (!first || !last || last < first || static_cast<size_t>(last - first) != packetSize - 1u)
+         {
+-            runtime->guestFree(packetAddress);
++            otx::liberaInterno(runtime, packetAddress);
+             return false;
+         }
+ 
+@@ -277,14 +332,14 @@ namespace ps2_stubs
+             SET_GPR_U32(&invocation.context, 31, 0u);
+             invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
+             {
+-                runtime->guestFree(packetAddress);
++                otx::liberaInterno(runtime, packetAddress);
+             };
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
+             return true;
+         }
+         catch (...)
+         {
+-            runtime->guestFree(packetAddress);
++            otx::liberaInterno(runtime, packetAddress);
+             return false;
+         }
+     }
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..e01b238 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -1,5 +1,6 @@
+ #include "Common.h"
+ #include "RPC.h"
++#include "../Stubs/SIF.h"
+ #include "../../ps2_iop_transport.h"
+ 
+ namespace ps2_syscalls
+@@ -970,34 +971,10 @@ namespace ps2_syscalls
+ 
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        uint32_t cid = getRegU32(ctx, 4);
+-        uint32_t packetAddr = getRegU32(ctx, 5);
+-        uint32_t packetSize = getRegU32(ctx, 6);
+-        uint32_t srcExtra = getRegU32(ctx, 7);
+-
+-        uint32_t sp = getRegU32(ctx, 29);
+-        uint32_t destExtra = 0;
+-        uint32_t sizeExtra = 0;
+-        readStackU32(rdram, sp, 0x10, destExtra);
+-        readStackU32(rdram, sp, 0x14, sizeExtra);
+-
+-        if (sizeExtra > 0 && srcExtra && destExtra)
+-        {
+-            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
+-        }
+-
+-        static int logCount = 0;
+-        if (logCount < 5)
+-        {
+-            RUNTIME_LOG("[sceSifSendCmd] cid=0x" << std::hex << cid
+-                                                 << " packet=0x" << packetAddr
+-                                                 << " psize=0x" << packetSize
+-                                                 << " extra=0x" << destExtra << std::dec << std::endl);
+-            ++logCount;
+-        }
+-
+-        // Return non-zero on success.
+-        setReturnS32(ctx, 1);
++        // Otavix: uma implementação só (Stubs/SIF.cpp): extras para a RAM do IOP com o EABI do EE
++        // (t0/t1) e o pacote entregue ao tratador que o IRX registrou no IOP emulado. Esta versão
++        // copiava os extras para a RAM do EE, lia t0/t1 da pilha e não entregava nada ao IOP.
++        ps2_stubs::sceSifSendCmd(rdram, ctx, runtime);
+     }
+ 
+     void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..69678e1 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -489,24 +489,16 @@ namespace ps2_syscalls
+         const uint32_t stackSize = stackSizeSigned > 0
+                                        ? static_cast<uint32_t>(stackSizeSigned)
+                                        : 0u;
++        // Otavix: com stack = -1 o kernel põe a pilha no FIM da RAM (base = RAM - tamanho) e devolve o
++        // TOPO dela; o runtime devolvia a base, e a pilha ficava logo abaixo de RAM - tamanho, dentro do
++        // heap que o jogo zera/usa até ali (MoH: o memset do heap apagava o $ra salvo e a thread morria;
++        // Ghost Rider: pilha sobre o heap, listas corrompidas)
++        uint32_t baseAuto = 0u;
+         if (stack == 0xFFFFFFFFu)
+         {
+-            if (stackSizeSigned > 0)
+-            {
+-                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
+-                if (requestedSize < PS2_RAM_SIZE)
+-                {
+-                    sp = PS2_RAM_SIZE - requestedSize;
+-                }
+-                else
+-                {
+-                    sp = PS2_RAM_SIZE;
+-                }
+-            }
+-            else
+-            {
+-                sp = PS2_RAM_SIZE;
+-            }
++            const uint32_t requestedSize = stackSizeSigned > 0 ? static_cast<uint32_t>(stackSizeSigned) : 0u;
++            baseAuto = requestedSize < PS2_RAM_SIZE ? PS2_RAM_SIZE - requestedSize : 0u;
++            sp = PS2_RAM_SIZE - 0x10u;
+         }
+         else if (stack != 0u)
+         {
+@@ -523,7 +515,7 @@ namespace ps2_syscalls
+         sp &= ~0xFu;
+         if (stack == 0xFFFFFFFFu)
+         {
+-            initialStack = sp;
++            initialStack = baseAuto;
+         }
+         else if (stack != 0u)
+         {
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..281a7c2 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -8,12 +8,15 @@
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <iostream>
+ #include <stdexcept>
++#include <string>
+ 
+ using namespace GSInternal;
+ 
+@@ -551,9 +554,19 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     DrawPrimitive(batch);
+ }
+ 
++bool otxJanelaLog();
++extern std::atomic<uint32_t> g_otxPrimSeq;
++
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    const bool reg = otxJanelaLog();
++    if (reg)
++        std::cout << "[clut] desenho=" << g_otxPrimSeq.load() << " cbp=0x" << std::hex << tex0.cbp << " psm=0x"
++                  << static_cast<uint32_t>(tex0.psm) << " cpsm=0x" << static_cast<uint32_t>(tex0.cpsm) << std::dec
++                  << " csm=" << static_cast<uint32_t>(tex0.csm) << " csa=" << static_cast<uint32_t>(tex0.csa)
++                  << " cld=" << static_cast<uint32_t>(tex0.cld) << " cbp0=0x" << std::hex << m_clutCbp[0]
++                  << " cbp1=0x" << m_clutCbp[1] << std::dec << std::endl;
+     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+         return;
+ 
+@@ -708,10 +721,220 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+     return result;
+ }
+ 
++// Otavix: número do desenho do GS (para cruzar com as trocas de buffer em outros registros)
++std::atomic<uint32_t> g_otxPrimSeq{0u};
++// Otavix: janela de registro por número de desenho: PS2X_LOG_SEQ=<de>,<n>, ou por tempo:
++// PS2X_LOG_SEQ_SEG=<segundos>,<n> (abre no primeiro desenho depois de <segundos>)
++static std::atomic<uint32_t> g_otxJanDe{0u}, g_otxJanAte{0u};
++static uint32_t g_otxJanSeg = 0u, g_otxJanN = 0u;
++static void otxJanelaIniciar()
++{
++    static const bool lido = []() {
++        if (const char *s = std::getenv("PS2X_LOG_SEQ"))
++        {
++            const uint32_t de = static_cast<uint32_t>(std::atoi(s));
++            const char *v = std::strchr(s, ',');
++            g_otxJanDe = de;
++            g_otxJanAte = de + (v ? static_cast<uint32_t>(std::atoi(v + 1)) : 300u);
++        }
++        else if (const char *s2 = std::getenv("PS2X_LOG_SEQ_SEG"))
++        {
++            g_otxJanSeg = static_cast<uint32_t>(std::atoi(s2));
++            const char *v = std::strchr(s2, ',');
++            g_otxJanN = v ? static_cast<uint32_t>(std::atoi(v + 1)) : 300u;
++        }
++        return true;
++    }();
++    (void)lido;
++}
++// chamado a cada desenho: abre a janela por tempo quando chegar a hora
++static void otxJanelaPorTempo(uint32_t seqI)
++{
++    if (g_otxJanSeg == 0u || g_otxJanAte.load(std::memory_order_relaxed) != 0u)
++        return;
++    static const auto t0 = std::chrono::steady_clock::now();
++    if (std::chrono::steady_clock::now() - t0 >= std::chrono::seconds(g_otxJanSeg))
++    {
++        g_otxJanDe = seqI;
++        g_otxJanAte = seqI + g_otxJanN;
++        std::cout << "[janela] aberta no desenho " << seqI << " (" << g_otxJanSeg << " s)" << std::endl;
++    }
++}
++bool otxJanelaLog()
++{
++    otxJanelaIniciar();
++    const uint32_t i = g_otxPrimSeq.load(std::memory_order_relaxed);
++    const uint32_t ate = g_otxJanAte.load(std::memory_order_relaxed);
++    return ate != 0u && i >= g_otxJanDe.load(std::memory_order_relaxed) && i < ate;
++}
++
++extern std::atomic<uint64_t> g_otxNsGs;
++namespace
++{
++    // Otavix: soma o tempo de cada desenho em g_otxNsGs (contador de desempenho do [fps])
++    struct OtxCronometroGs
++    {
++        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        ~OtxCronometroGs()
++        {
++            g_otxNsGs.fetch_add(static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
++        }
++    };
++}
++
+ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+ {
++    const OtxCronometroGs otxCronometro;
+     const GSDrawState &state = batch.state;
+     const auto &ctx = state.context;
++    {
++        // Otavix: PS2X_LOG_TEX=N registra os N primeiros desenhos COM textura (o log comum só
++        // pega os 64 primeiros desenhos da execução, que costumam ser limpezas de tela)
++        static const uint32_t limite = []() {
++            const char *s = std::getenv("PS2X_LOG_TEX");
++            return s ? static_cast<uint32_t>(std::atoi(s)) : 0u;
++        }();
++        static std::atomic<uint32_t> n{0u};
++        // PS2X_LOG_SEQ=<de>,<quantos> (ou PS2X_LOG_SEQ_SEG=<s>,<quantos>): registra em ordem TODOS
++        // os desenhos da janela
++        otxJanelaIniciar();
++        const uint32_t seqI = g_otxPrimSeq.fetch_add(1u, std::memory_order_relaxed);
++        otxJanelaPorTempo(seqI);
++        const uint32_t seqAte = g_otxJanAte.load(std::memory_order_relaxed);
++        if (seqAte && seqI >= g_otxJanDe.load(std::memory_order_relaxed) && seqI < seqAte)
++        {
++            const int ox = ctx.xyoffset.ofx >> 4, oy = ctx.xyoffset.ofy >> 4;
++            std::cout << "[seq] " << seqI << " type=" << static_cast<uint32_t>(state.prim.type)
++                      << " ctxt=" << static_cast<uint32_t>(state.prim.ctxt)
++                      << " tme=" << static_cast<uint32_t>(state.prim.tme) << " abe=" << static_cast<uint32_t>(state.prim.abe)
++                      << " fbp=" << ctx.frame.fbp << " p0=(" << (batch.vertices[0].x - ox) << "," << (batch.vertices[0].y - oy) << ")"
++                      << " p1=(" << (batch.vertices[1].x - ox) << "," << (batch.vertices[1].y - oy) << ")"
++                      << " rgba=(" << static_cast<uint32_t>(batch.vertices[0].r) << "," << static_cast<uint32_t>(batch.vertices[0].g)
++                      << "," << static_cast<uint32_t>(batch.vertices[0].b) << "," << static_cast<uint32_t>(batch.vertices[0].a) << ")"
++                      << " tbp0=0x" << std::hex << ctx.tex0.tbp0 << " tpsm=0x" << static_cast<uint32_t>(ctx.tex0.psm)
++                      << " alpha=0x" << ctx.alpha << " test=0x" << ctx.test << std::dec << " z=" << batch.vertices[0].z << std::endl;
++        }
++        // PS2X_DUMP_FB=<n>: no início do desenho n grava os buffers de quadro 0 e 150 (CT32, 640x480)
++        // em <PS2X_DUMP_TEX>/fb_<n>_<fbp>.rgba
++        static const uint32_t dumpFbEm = []() { const char *s = std::getenv("PS2X_DUMP_FB"); return s ? static_cast<uint32_t>(std::atoi(s)) : 0xFFFFFFFFu; }();
++        if (seqI == dumpFbEm)
++        {
++            const char *dir = std::getenv("PS2X_DUMP_TEX");
++            for (uint32_t fbpPag : {0u, 150u})
++            {
++                std::vector<uint32_t> px(640u * 480u);
++                const uint32_t base = GSInternal::framePageBaseToBlock(fbpPag);
++                for (uint32_t yy = 0; yy < 480u; ++yy)
++                    for (uint32_t xx = 0; xx < 640u; ++xx)
++                        px[yy * 640u + xx] = ReadVramUnlocked(GS_PSM_CT32, base, 10u, xx, yy) | 0xFF000000u;
++                char nome[512];
++                std::snprintf(nome, sizeof nome, "%s/fb_%u_%u.rgba", dir ? dir : ".", seqI, fbpPag);
++                if (FILE *f = std::fopen(nome, "wb")) { std::fwrite(px.data(), 4, px.size(), f); std::fclose(f); }
++                std::cout << "[dumpfb] " << nome << std::endl;
++            }
++        }
++        // PS2X_DUMP_TEX=<pasta>: decodifica (com a paleta) cada textura de paleta na 1a vez em que é
++        // usada, até 8, e grava tex_<tbp0>_<psm>_<w>x<h>.rgba (RGBA cru) + uma linha de resumo
++        static const char *dumpDir = std::getenv("PS2X_DUMP_TEX");
++        // PS2X_DUMP_TEX_JANELA=1: só dentro da janela de PS2X_LOG_SEQ/PS2X_LOG_SEQ_SEG
++        static const bool dumpSoJanela = std::getenv("PS2X_DUMP_TEX_JANELA") != nullptr;
++        const bool texPaleta = ctx.tex0.psm == GS_PSM_T8 || ctx.tex0.psm == GS_PSM_T4 || ctx.tex0.psm == GS_PSM_T8H ||
++                               ctx.tex0.psm == GS_PSM_T4HL || ctx.tex0.psm == GS_PSM_T4HH;
++        if (dumpDir && *dumpDir && state.prim.tme && (!dumpSoJanela || otxJanelaLog()))
++        {
++            // chave: endereço, formato, paleta e um resumo dos primeiros texels (o jogo reaproveita
++            // o mesmo endereço para texturas diferentes)
++            static std::vector<uint64_t> vistos;
++            uint64_t chave = (static_cast<uint64_t>(ctx.tex0.tbp0) << 40) ^ (static_cast<uint64_t>(ctx.tex0.psm) << 32) ^
++                             (static_cast<uint64_t>(ctx.tex0.cbp) << 16);
++            for (uint32_t k = 0; k < 32u; ++k)
++                chave = (chave ^ ReadTextureVramUnlocked(ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, k * 3u, k)) * 1099511628211ull;
++            if (vistos.size() < 64 && std::find(vistos.begin(), vistos.end(), chave) == vistos.end())
++            {
++                vistos.push_back(chave);
++                const uint32_t w = 1u << std::min<uint32_t>(ctx.tex0.tw, 10u), h = 1u << std::min<uint32_t>(ctx.tex0.th, 10u);
++                std::vector<uint32_t> px(static_cast<size_t>(w) * h);
++                uint32_t naoZeroIdx = 0, alfaNaoZero = 0;
++                for (uint32_t yy = 0; yy < h; ++yy)
++                    for (uint32_t xx = 0; xx < w; ++xx)
++                    {
++                        const uint32_t idx = ReadTextureVramUnlocked(ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, xx, yy);
++                        if (idx) ++naoZeroIdx;
++                        uint32_t c = idx;
++                        if (texPaleta)
++                            c = LookupCLUT(state, static_cast<uint8_t>(idx), ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
++                        else if (ctx.tex0.psm == GS_PSM_CT16 || ctx.tex0.psm == GS_PSM_CT16S)
++                            c = Rgba5551ToRgba8888(idx);
++                        if (c >> 24) ++alfaNaoZero;
++                        px[static_cast<size_t>(yy) * w + xx] = c;
++                    }
++                char nome[512];
++                std::snprintf(nome, sizeof nome, "%s/tex_%05x_%02x_%ux%u.rgba", dumpDir, ctx.tex0.tbp0, ctx.tex0.psm, w, h);
++                if (FILE *f = std::fopen(nome, "wb")) { std::fwrite(px.data(), 4, px.size(), f); std::fclose(f); }
++                std::cout << "[dumptex] " << nome << " indices!=0: " << naoZeroIdx << " alfa!=0: " << alfaNaoZero
++                          << " de " << (w * h) << std::endl;
++                {
++                    // índices distintos, as 8 primeiras entradas da CLUT carregada e a paleta crua na VRAM
++                    std::vector<uint32_t> hist(256u, 0u);
++                    for (uint32_t yy = 0; yy < h; ++yy)
++                        for (uint32_t xx = 0; xx < w; ++xx)
++                            ++hist[ReadTextureVramUnlocked(ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, xx, yy) & 0xFFu];
++                    uint32_t distintos = 0;
++                    for (uint32_t v : hist) distintos += v ? 1u : 0u;
++                    {
++                        // os índices crus (1 byte por texel) e a paleta crua (256 x CT32) ao lado do .rgba
++                        std::vector<uint8_t> idx(static_cast<size_t>(w) * h);
++                        for (uint32_t yy = 0; yy < h; ++yy)
++                            for (uint32_t xx = 0; xx < w; ++xx)
++                                idx[static_cast<size_t>(yy) * w + xx] = static_cast<uint8_t>(ReadTextureVramUnlocked(ctx.tex0.psm, ctx.tex0.tbp0, ctx.tex0.tbw, xx, yy));
++                        std::string base(nome);
++                        base.resize(base.size() - 5);
++                        if (FILE *f = std::fopen((base + ".idx").c_str(), "wb")) { std::fwrite(idx.data(), 1, idx.size(), f); std::fclose(f); }
++                        std::vector<uint32_t> pal(256u);
++                        for (uint32_t k = 0; k < 256u; ++k)
++                            pal[k] = static_cast<uint32_t>(m_clut[k]) | (static_cast<uint32_t>(m_clut[k + 256u]) << 16u);
++                        if (FILE *f = std::fopen((base + ".pal").c_str(), "wb")) { std::fwrite(pal.data(), 4, pal.size(), f); std::fclose(f); }
++                    }
++                    std::cout << "[dumptex]   tbw=" << static_cast<uint32_t>(ctx.tex0.tbw) << " cbp=0x" << std::hex << ctx.tex0.cbp
++                              << std::dec << " indices distintos=" << distintos << " clut[0..7]=";
++                    for (uint32_t k = 0; k < 8u; ++k)
++                        std::cout << std::hex << (static_cast<uint32_t>(m_clut[k]) | (static_cast<uint32_t>(m_clut[k + 256u]) << 16u)) << std::dec << ' ';
++                    std::cout << " vram(cbp)[0..7]=";
++                    for (uint32_t k = 0; k < 8u; ++k)
++                        std::cout << std::hex << ReadTextureVramUnlocked(GS_PSM_CT32, ctx.tex0.cbp, 1u, k, 0u) << std::dec << ' ';
++                    std::cout << std::endl;
++                }
++            }
++        }
++        const bool texNaJanela = otxJanelaLog();
++        if ((limite || texNaJanela) && state.prim.tme)
++        {
++            const uint32_t i = n.fetch_add(1u, std::memory_order_relaxed);
++            if (i < limite || texNaJanela)
++            {
++                std::cout << "[tex] " << i << " type=" << static_cast<uint32_t>(state.prim.type)
++                          << " fst=" << static_cast<uint32_t>(state.prim.fst)
++                          << " abe=" << static_cast<uint32_t>(state.prim.abe)
++                          << " fbp=" << ctx.frame.fbp << " fpsm=0x" << std::hex << static_cast<uint32_t>(ctx.frame.psm)
++                          << " tbp0=0x" << ctx.tex0.tbp0 << " tpsm=0x" << static_cast<uint32_t>(ctx.tex0.psm) << std::dec
++                          << " tbw=" << static_cast<uint32_t>(ctx.tex0.tbw)
++                          << " tw=" << static_cast<uint32_t>(ctx.tex0.tw) << " th=" << static_cast<uint32_t>(ctx.tex0.th)
++                          << " tcc=" << static_cast<uint32_t>(ctx.tex0.tcc) << " tfx=" << static_cast<uint32_t>(ctx.tex0.tfx)
++                          << " cbp=0x" << std::hex << ctx.tex0.cbp << " cpsm=0x" << static_cast<uint32_t>(ctx.tex0.cpsm) << std::dec
++                          << " csm=" << static_cast<uint32_t>(ctx.tex0.csm) << " csa=" << static_cast<uint32_t>(ctx.tex0.csa)
++                          << " test=0x" << std::hex << ctx.test << " alpha=0x" << ctx.alpha << std::dec
++                          << " v0=(" << batch.vertices[0].x << "," << batch.vertices[0].y << ")"
++                          << " v1=(" << batch.vertices[1].x << "," << batch.vertices[1].y << ")"
++                          << " uv0=(" << (batch.vertices[0].u >> 4) << "," << (batch.vertices[0].v >> 4) << ")"
++                          << " uv1=(" << (batch.vertices[1].u >> 4) << "," << (batch.vertices[1].v >> 4) << ")"
++                          << " st0=(" << batch.vertices[0].s << "," << batch.vertices[0].t << "," << batch.vertices[0].q << ")"
++                          << " rgba0=(" << static_cast<uint32_t>(batch.vertices[0].r) << "," << static_cast<uint32_t>(batch.vertices[0].g)
++                          << "," << static_cast<uint32_t>(batch.vertices[0].b) << "," << static_cast<uint32_t>(batch.vertices[0].a) << ")"
++                          << " n=" << batch.vertexCount << std::endl;
++            }
++        }
++    }
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
+         if (primitiveIndex < 64u)
+@@ -871,13 +1094,17 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+     const u32 zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+     const u32 zpsm = ctx.zbuf.psm;
+ 
+-    const PixelWriteMask writeMask = classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
++    // Otavix (diagnóstico): PS2X_DIAG_SEM_ATEST=1 ignora o teste de alfa, PS2X_DIAG_SEM_Z=1 aceita
++    // sempre a profundidade
++    static const bool diagSemAtest = []() { const char *s = std::getenv("PS2X_DIAG_SEM_ATEST"); return s && *s == '1'; }();
++    static const bool diagSemZ = []() { const char *s = std::getenv("PS2X_DIAG_SEM_Z"); return s && *s == '1'; }();
++    const PixelWriteMask writeMask = diagSemAtest ? PixelWriteMask{} : classifyAlphaTest(ctx.test, a, static_cast<uint8_t>(fpsm));
+     if (!writeMask.writesAnything())
+     {
+         return;
+     }
+ 
+-    const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
++    const uint32_t ztestMethod = diagSemZ ? 1u : static_cast<uint32_t>((ctx.test >> 17) & 3u);
+     const bool alphaBlendEnabled = state.prim.abe;
+     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
+     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
+@@ -1310,6 +1537,11 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
++    // Otavix (diagnóstico): PS2X_DIAG_TRI=N descreve os N primeiros triângulos com textura
++    static const uint32_t diagLimite = []() { const char *s = std::getenv("PS2X_DIAG_TRI"); return s ? static_cast<uint32_t>(std::atoi(s)) : 0u; }();
++    static std::atomic<uint32_t> diagN{0u};
++    const bool diagTri = diagLimite && state.prim.tme && diagN.fetch_add(1u, std::memory_order_relaxed) < diagLimite;
++    uint32_t diagPix = 0, diagCor = 0; int diagX = -1, diagY = -1;
+ 
+     for (int y = minY; y <= maxY; ++y)
+     {
+@@ -1388,9 +1620,24 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+             }
+ 
+             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
++            if (diagTri && state.prim.tme)
++            {
++                if (diagPix++ == 0)
++                {
++                    diagCor = (static_cast<uint32_t>(a) << 24) | (static_cast<uint32_t>(b) << 16) | (static_cast<uint32_t>(g) << 8) | r;
++                    diagX = x; diagY = y;
++                }
++            }
+             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+         }
+     }
++    if (diagTri && state.prim.tme)
++    {
++        std::cout << "[tri] pixels=" << diagPix << " 1o=(" << diagX << "," << diagY << ") cor=0x" << std::hex << diagCor
++                  << std::dec << " caixa=(" << minX << "," << minY << ")-(" << maxX << "," << maxY << ")"
++                  << " zbuf=0x" << std::hex << ctx.zbuf.zbp << " zpsm=0x" << static_cast<uint32_t>(ctx.zbuf.psm)
++                  << " fbmsk=0x" << ctx.frame.fbmsk << std::dec << " z0=" << v0.z << std::endl;
++    }
+ }
+ 
+ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+@@ -1463,6 +1710,12 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    if (otxJanelaLog())
++        std::cout << "[trx] desenho=" << g_otxPrimSeq.load() << " dir=" << static_cast<uint32_t>(command.direction)
++                  << " dbp=0x" << std::hex << command.bitbltbuf.dbp << " dpsm=0x" << static_cast<uint32_t>(command.bitbltbuf.dpsm)
++                  << std::dec << " dbw=" << static_cast<uint32_t>(command.bitbltbuf.dbw)
++                  << " pos=(" << command.trxpos.dsax << "," << command.trxpos.dsay << ")"
++                  << " tam=" << command.trxreg.rrw << "x" << command.trxreg.rrh << std::endl;
+     m_transfer = command;
+     m_transferState.x = command.trxpos.dsax;
+     m_transferState.y = command.trxpos.dsay;
+@@ -1482,12 +1735,41 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
++    // Otavix: o cache de 1 página de textura só era invalidado pelo TEXFLUSH; um jogo que sobe outra
++    // textura no mesmo lugar da VRAM (cache de texturas do Spawn) lia os bytes da anterior
++    m_texturePageCache.Invalidate();
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+         return;
+ 
+     const uint32_t dbp = m_transfer.bitbltbuf.dbp;
+     const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
+     const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
++    // Otavix (diagnóstico): na janela, os 8 primeiros valores de cada paleta (16x16 CT32) que sobe
++    // (ou, com PS2X_LOG_PAL=<segundos>, as paletas DISTINTAS que sobem depois desse tempo, até 300)
++    static const int logPalSeg = []() { const char *s = std::getenv("PS2X_LOG_PAL"); return s ? std::atoi(s) : -1; }();
++    static const auto palT0 = std::chrono::steady_clock::now();
++    static std::vector<uint64_t> palVistas;
++    bool palNova = false;
++    if (logPalSeg >= 0 && palVistas.size() < 300u && dpsm == GS_PSM_CT32 && m_transfer.trxreg.rrw == 16u &&
++        m_transfer.trxreg.rrh == 16u && m_transferState.copiedPixels == 0u && sizeBytes >= 1024u &&
++        std::chrono::steady_clock::now() - palT0 >= std::chrono::seconds(logPalSeg))
++    {
++        uint64_t h = 1469598103934665603ull;
++        for (uint32_t k = 0; k < 1024u; ++k) h = (h ^ data[k]) * 1099511628211ull;
++        if (std::find(palVistas.begin(), palVistas.end(), h) == palVistas.end()) { palVistas.push_back(h); palNova = true; }
++    }
++    if ((otxJanelaLog() || palNova) && dpsm == GS_PSM_CT32 && m_transfer.trxreg.rrw == 16u &&
++        m_transfer.trxreg.rrh == 16u && m_transferState.copiedPixels == 0u && sizeBytes >= 32u)
++    {
++        std::cout << "[pal] dbp=0x" << std::hex << dbp << " dados=";
++        for (uint32_t k = 0; k < 8u; ++k)
++        {
++            uint32_t v = 0;
++            std::memcpy(&v, data + k * 4u, 4u);
++            std::cout << v << ' ';
++        }
++        std::cout << std::dec << std::endl;
++    }
+     const uint32_t rrw = m_transfer.trxreg.rrw;
+     const uint32_t dsax = m_transfer.trxpos.dsax;
+     uint32_t offset = 0u;
+@@ -1586,6 +1868,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ 
+ void GSCpuBackend::PerformLocalToLocalTransfer()
+ {
++    m_texturePageCache.Invalidate();
+     if (!m_vram)
+         return;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..cf6f704 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -10,6 +10,10 @@
+ #include <iostream>
+ #include <sstream>
+ 
++// Otavix: diagnóstico (gs_cpu_backend.cpp)
++extern std::atomic<uint32_t> g_otxPrimSeq;
++bool otxJanelaLog();
++
+ namespace
+ {
+     static constexpr uint32_t kHostFrameWidth = 640u;
+@@ -568,6 +572,8 @@ void GS::latchHostPresentationFrame()
+         m_hasHostPresentationFrame = hasFrame;
+     }
+ 
++    if (otxJanelaLog())
++        std::cout << "[latch] desenho=" << g_otxPrimSeq.load() << " displayFbp=" << displayFbp << " sourceFbp=" << sourceFbp << std::endl;
+     if (hasFrame)
+     {
+         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..14bce91 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,14 +1,21 @@
++#include <cstdlib>
+ #include "runtime/ps2_memory.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <iostream>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+ #include <algorithm>
+ #include <string>
+ #include <vector>
++#include <atomic>
++#include <iostream>
++// Otavix: número do desenho do GS (gs_cpu_backend.cpp), para os registros de diagnóstico
++extern std::atomic<uint32_t> g_otxPrimSeq;
++bool otxJanelaLog();
+ 
+ namespace
+ {
+@@ -1022,6 +1029,16 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+         {
++            if (regOff == 0x70u)
++            {
++                // Otavix (diagnóstico): as 20 primeiras trocas de DISPFB1 por escrita direta
++                static int nLog = 0;
++                if (otxJanelaLog())
++                {
++                    ++nLog;
++                    std::cout << "[dispfb1:mem] fbp=" << (value & 0x1FFu) << " desenho=" << g_otxPrimSeq.load() << std::endl;
++                }
++            }
+             *reg = value;
+         }
+         return;
+@@ -1296,6 +1313,35 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         {
+             const auto dctrlIt = m_ioRegisters.find(0x1000E000u);
+             const bool dmacEnabled = (dctrlIt == m_ioRegisters.end()) || ((dctrlIt->second & 0x1u) != 0u);
++            // Otavix: PS2X_LOG_DMA=<n> registra as n primeiras partidas de DMA e o CHCR resultante
++            static int otxLogDma = []
++            {
++                const char *e = std::getenv("PS2X_LOG_DMA");
++                return e ? std::atoi(e) : 0;
++            }();
++            struct OtxLogDmaFim
++            {
++                PS2Memory *mem;
++                uint32_t canal;
++                bool ativo;
++                ~OtxLogDmaFim()
++                {
++                    if (ativo)
++                        std::cerr << "    -> chcr=0x" << std::hex << mem->m_ioRegisters[canal] << " tadr=0x"
++                                  << mem->m_ioRegisters[canal + 0x30] << " madr=0x" << mem->m_ioRegisters[canal + 0x10]
++                                  << std::dec << std::endl;
++                }
++            } otxFim{this, address & 0xFFFFFF00u, otxLogDma > 0};
++            if (otxLogDma > 0)
++            {
++                --otxLogDma;
++                const uint32_t canal = address & 0xFFFFFF00u;
++                std::cerr << "[dma:inicio] canal=0x" << std::hex << canal << " chcr=0x" << value << " madr=0x"
++                          << m_ioRegisters[canal + 0x10] << " qwc=0x" << m_ioRegisters[canal + 0x20] << " tadr=0x"
++                          << m_ioRegisters[canal + 0x30] << " dctrl=0x"
++                          << (dctrlIt == m_ioRegisters.end() ? 0xFFFFFFFFu : dctrlIt->second) << std::dec
++                          << (dmacEnabled ? "" : " (DMAC DESLIGADO: ignorado)") << std::endl;
++            }
+             if (!dmacEnabled)
+             {
+                 return true;
+@@ -1305,6 +1351,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
+             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
++            if (otxJanelaLog())
++                std::cout << "[dma] canal=0x" << std::hex << channelBase << " madr=0x" << madr
++                          << " tadr=0x" << m_ioRegisters[channelBase + 0x30] << " qwc=0x" << qwc
++                          << " chcr=0x" << value << std::dec << " desenho=" << g_otxPrimSeq.load() << std::endl;
+ 
+             if (tryProcessScratchpadDma(channelBase, value))
+             {
+@@ -1859,6 +1909,8 @@ void PS2Memory::processPendingTransfers()
+     }
+     m_pendingVif1Transfers.clear();
+ 
++    if (otxJanelaLog())
++        std::cout << "[gif:drena] desenho=" << g_otxPrimSeq.load() << std::endl;
+     if (m_gifArbiter)
+         m_gifArbiter->drain();
+ 
+@@ -1948,6 +2000,11 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+     if (!data || sizeBytes < 16)
+         return;
+ 
++    if (otxJanelaLog())
++        std::cout << "[gif] path=" << static_cast<int>(pathId) << " bytes=" << sizeBytes
++                  << " mask3=" << (m_path3Masked ? 1 : 0) << " drena=" << (drainImmediately ? 1 : 0)
++                  << " desenho=" << g_otxPrimSeq.load() << std::endl;
++
+     if (pathId == GifPathId::Path3)
+     {
+         if (m_path3Masked)
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..5278174 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,11 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include <cmath>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
++#include <utility>
++#include <vector>
+ 
+ namespace
+ {
+@@ -119,6 +124,89 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_SELECT);
+     }
+ 
++    {
++        // Otavix: PS2X_ROTEIRO="10:CIRCLE,15:CROSS+START,*5:CROSS,40:LUP/3" aperta botões por tempo
++        // (segundos desde a 1a leitura do controle; cada toque dura 0,25 s ou /D segundos; *N = a cada
++        // N s), para testes sem tela. LUP/LDOWN/LLEFT/LRIGHT e RUP/... inclinam os analógicos até o fim.
++        struct Toque { double t; double cada; uint16_t mask; double dur; uint8_t eixos; };
++        static std::vector<Toque> roteiro;
++        static bool lido = false;
++        static double t0 = 0.0;
++        if (!lido)
++        {
++            lido = true;
++            t0 = GetTime();
++            const char *r = std::getenv("PS2X_ROTEIRO");
++            static const std::pair<const char *, uint16_t> nomes[] = {
++                {"UP", PAD_UP}, {"DOWN", PAD_DOWN}, {"LEFT", PAD_LEFT}, {"RIGHT", PAD_RIGHT},
++                {"CROSS", PAD_CROSS}, {"CIRCLE", PAD_CIRCLE}, {"SQUARE", PAD_SQUARE},
++                {"TRIANGLE", PAD_TRIANGLE}, {"START", PAD_START}, {"SELECT", PAD_SELECT},
++                {"L1", PAD_L1}, {"R1", PAD_R1}, {"L2", PAD_L2}, {"R2", PAD_R2}};
++            std::string s = r ? r : "";
++            size_t i = 0;
++            while (i < s.size())
++            {
++                size_t j = s.find(',', i);
++                if (j == std::string::npos) j = s.size();
++                const std::string item = s.substr(i, j - i);
++                i = j + 1;
++                const size_t dp = item.find(':');
++                if (dp == std::string::npos) continue;
++                Toque tq{0.0, 0.0, 0, 0.25, 0};
++                if (!item.empty() && item[0] == '*')
++                {
++                    tq.cada = std::atof(item.c_str() + 1);
++                    tq.t = tq.cada;
++                }
++                else
++                {
++                    tq.t = std::atof(item.c_str());
++                }
++                std::string bts = item.substr(dp + 1);
++                const size_t barra = bts.find('/');
++                if (barra != std::string::npos)
++                {
++                    tq.dur = std::atof(bts.c_str() + barra + 1);
++                    bts = bts.substr(0, barra);
++                }
++                static const std::pair<const char *, uint8_t> eixosNomes[] = {
++                    {"LUP", 1}, {"LDOWN", 2}, {"LLEFT", 4}, {"LRIGHT", 8},
++                    {"RUP", 16}, {"RDOWN", 32}, {"RLEFT", 64}, {"RRIGHT", 128}};
++                size_t k = 0;
++                while (k <= bts.size())
++                {
++                    size_t m = bts.find('+', k);
++                    if (m == std::string::npos) m = bts.size();
++                    const std::string nome = bts.substr(k, m - k);
++                    for (const auto &n : nomes)
++                        if (nome == n.first) tq.mask |= n.second;
++                    for (const auto &e : eixosNomes)
++                        if (nome == e.first) tq.eixos |= e.second;
++                    k = m + 1;
++                }
++                if (tq.mask || tq.eixos) roteiro.push_back(tq);
++            }
++        }
++        const double agora = GetTime() - t0;
++        for (const Toque &tq : roteiro)
++        {
++            double fase = agora - tq.t;
++            if (tq.cada > 0.0 && fase >= 0.0) fase = std::fmod(fase, tq.cada);
++            if (fase >= 0.0 && fase < tq.dur)
++            {
++                clearBit(tq.mask);
++                if (tq.eixos & 1) data[7] = 0;
++                if (tq.eixos & 2) data[7] = 255;
++                if (tq.eixos & 4) data[6] = 0;
++                if (tq.eixos & 8) data[6] = 255;
++                if (tq.eixos & 16) data[5] = 0;
++                if (tq.eixos & 32) data[5] = 255;
++                if (tq.eixos & 64) data[4] = 0;
++                if (tq.eixos & 128) data[4] = 255;
++            }
++        }
++    }
++
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
+     return true;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..39fc28b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -20,6 +20,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
++#include <cmath>
+ #include <limits>
+ #include <chrono>
+ #include <atomic>
+@@ -27,6 +28,21 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++// Otavix: diagnóstico (gs_cpu_backend.cpp)
++bool otxJanelaLog();
++// Otavix: vigia de escrita na RAM (Kernel/OtavixVigia.cpp)
++namespace otx { using PegaPc = void (*)(uint32_t &pc, uint32_t &ra); void vigiaIniciar(uint8_t *rdram, PegaPc pegaPc); }
++static PS2Runtime *g_otxRuntime = nullptr;
++std::atomic<uint32_t> g_otxTrocas{0u};
++// Otavix: tempo (ns) gasto no VU1 (inclui o GS chamado pelo XGKICK) e no desenho do GS
++std::atomic<uint64_t> g_otxNsVu1{0u}, g_otxNsGs{0u};
++extern std::atomic<uint64_t> g_otxVu1Runs, g_otxVu1Instr, g_otxVu1Ciclos, g_otxVu1Esgotou, g_otxVu1Refeitos;
++#if AGRESSIVE_LOGS
++#define PS2_AGRESSIVO_LIGADO true
++#else
++#define PS2_AGRESSIVO_LIGADO false
++#endif
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -91,6 +107,9 @@ namespace
+     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
+     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
++    // Otavix: área das pilhas de callback/interrupção do runtime (kernel do EE; o jogo carrega em 0x100000)
++    constexpr uint32_t kOtxPilhasCallbackBase = 0x00080000u;
++    constexpr uint32_t kOtxPilhasCallbackTopo = 0x00100000u;
+ 
+     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
+     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
+@@ -503,8 +522,10 @@ PS2Runtime::PS2Runtime()
+     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
+     m_guestHeapConfigured = false;
+-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
++    // Otavix: as pilhas de callback/interrupção ficam na área do kernel (0x80000-0x100000, que o jogo
++    // não usa); no topo da RAM fica a pilha do próprio jogo (SetupThread com stack = -1), como no EE real
++    m_asyncCallbackStackFloor = kOtxPilhasCallbackBase;
++    m_asyncCallbackStackTop = kOtxPilhasCallbackTopo;
+ }
+ 
+ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+@@ -570,6 +591,12 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, con
+     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
+ }
+ 
++bool PS2Runtime::deliverIopSifCommand(uint32_t cid, const void *packet, uint32_t size)
++{
++    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
++    return m_iopSubsystem->deliverEeSifCommand(cid, packet, size);
++}
++
+ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+ {
+     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+@@ -679,9 +706,11 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     const auto otxT0 = std::chrono::steady_clock::now();
+                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
++                                     g_otxNsVu1.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - otxT0).count()));
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -697,9 +726,11 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     const auto otxT0 = std::chrono::steady_clock::now();
+                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, top, itop, 65536);
++                                     g_otxNsVu1.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - otxT0).count()));
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -731,9 +762,18 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
++        {
++            // Otavix: PS2X_JANELA=oculta (testes sem tela) ou sem_foco (abre sem tirar o foco de
++            // quem está usando o PC); PS2X_MUDO=1 não abre o áudio
++            unsigned int flags = FLAG_WINDOW_RESIZABLE;
++            const char *jan = std::getenv("PS2X_JANELA");
++            if (jan && std::string(jan) == "oculta") flags |= FLAG_WINDOW_HIDDEN;
++            if (jan && std::string(jan) == "sem_foco") flags |= FLAG_WINDOW_UNFOCUSED;
++            SetConfigFlags(flags);
++        }
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+-        InitAudioDevice();
++        if (const char *mudo = std::getenv("PS2X_MUDO"); !(mudo && *mudo == '1'))
++            InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+         SetTargetFPS(60);
+@@ -971,9 +1011,8 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+     }
+     {
+         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
++        m_asyncCallbackStackFloor = kOtxPilhasCallbackBase;
++        m_asyncCallbackStackTop = kOtxPilhasCallbackTopo;
+     }
+ 
+     LoadedModule module;
+@@ -1009,6 +1048,29 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+                                       elfCrc32,
+                                       elfCrc32Valid);
+ 
++    // Otavix: PS2X_RET=<endereço hex>:<0|1>,... troca funções do jogo por "return 0/1" sem retraduzir
++    // (as chamadas passam pela tabela). O jogar.cmd do Spawn usa 10CB08:1 para pular os vídeos.
++    if (const char *otxRet = std::getenv("PS2X_RET"))
++    {
++        const std::string lista(otxRet);
++        size_t i = 0;
++        while (i < lista.size())
++        {
++            size_t j = lista.find(',', i);
++            if (j == std::string::npos)
++                j = lista.size();
++            const std::string item = lista.substr(i, j - i);
++            i = j + 1;
++            const size_t dp = item.find(':');
++            if (dp == std::string::npos || dp + 1 >= item.size())
++                continue;
++            const uint32_t endereco = static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 16));
++            const bool um = item[dp + 1] == '1';
++            if (replaceFunction(endereco, um ? &ps2_stubs::ret1 : &ps2_stubs::ret0))
++                std::cerr << "[PS2X_RET] 0x" << std::hex << endereco << std::dec << " devolve " << (um ? 1 : 0) << std::endl;
++        }
++    }
++
+     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
+     return true;
+ }
+@@ -1064,6 +1126,16 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+         paths.cdRoot = paths.elfDirectory;
+         paths.mcRoot = paths.elfDirectory / "mc0";
+     }
++    // Otavix: a ISO do jogador, para os jogos que leem o disco por setor (sceCdRead por LBN)
++    if (const char *iso = std::getenv("PS2X_CD_IMAGE"); iso && *iso)
++    {
++        paths.cdImage = std::filesystem::path(iso);
++    }
++    // e a raiz do disco extraído, quando o executável não fica nela (MoH: MOH4\MOH4RDVD.ELF)
++    if (const char *raiz = std::getenv("PS2X_CD_ROOT"); raiz && *raiz)
++    {
++        paths.cdRoot = std::filesystem::path(raiz);
++    }
+ 
+     setIoPaths(paths);
+ }
+@@ -1468,6 +1540,15 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+     const uint32_t syscallId = (encodedSyscallId != 0u)
+                                    ? encodedSyscallId
+                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
++    {
++        // Otavix: PS2X_LOG_SYSCALL=N registra os N primeiros syscalls (número, pc, ra, a0..a3)
++        static const int limite = []() { const char *s = std::getenv("PS2X_LOG_SYSCALL"); return s ? std::atoi(s) : 0; }();
++        static std::atomic<int> n{0};
++        if (limite > 0 && n.fetch_add(1) < limite)
++            std::cout << "[syscall] " << std::hex << "0x" << syscallId << " pc=0x" << ctx->pc << " ra=0x" << getRegU32(ctx, 31)
++                      << " a0=0x" << getRegU32(ctx, 4) << " a1=0x" << getRegU32(ctx, 5) << " a2=0x" << getRegU32(ctx, 6)
++                      << " a3=0x" << getRegU32(ctx, 7) << std::dec << std::endl;
++    }
+ 
+     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
+     {
+@@ -2107,6 +2188,14 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
+ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
+ {
+     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
++    if (vaddr == 0x10009000u && ctx && rdram && otxJanelaLog())
++    {
++        auto rd = [&](uint32_t a) -> uint32_t { uint32_t v = 0; std::memcpy(&v, rdram + (a & 0x1FFFFFFu), 4); return v; };
++        const uint32_t sp = GPR_U32(ctx, 29);
++        std::cout << "[chcr1] ra=0x" << std::hex << GPR_U32(ctx, 31) << " sp=0x" << sp << " a0=0x" << GPR_U32(ctx, 4)
++                  << " status=0x" << ctx->cop0_status << " pilha20=0x" << rd(sp + 0x20u) << " pilha50=0x" << rd(sp + 0x50u)
++                  << " pilha80=0x" << rd(sp + 0x80u) << std::dec << std::endl;
++    }
+     try
+     {
+         m_memory.write32(vaddr, value);
+@@ -2339,6 +2428,91 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
+ }
+ 
++// Otavix: teste diferencial das rotinas de double por software do jogo (PS2X_TESTA_DOUBLE=
++// nome:endereço,... com nome em dpmul/dpadd/dpsub/dpdiv/pow/ipow/sqrt/litodp/dptoli/fptodp e
++// PS2X_TESTA_GP=<gp do jogo>): chama o código traduzido com entradas conhecidas (doubles em GPR de 64
++// bits, resultado em v0) por um mini-despachante e compara com a conta nativa.
++static bool otxChamaGuest(PS2Runtime *rt, uint8_t *rdram, uint32_t addr, uint32_t gp, uint64_t a0, uint64_t a1,
++                          float f12, uint64_t &v0)
++{
++    constexpr uint32_t kSentinela = 0x00000FF0u;
++    R5900Context c{};
++    std::memset(static_cast<void *>(&c), 0, sizeof(c));
++    c.cop0_status = 0x00010001u;
++    SET_GPR_U32(&c, 28, gp);
++    SET_GPR_U32(&c, 29, 0x01E80000u);
++    SET_GPR_U32(&c, 31, kSentinela);
++    c.r[4] = _mm_set_epi64x(0, static_cast<int64_t>(a0));
++    c.r[5] = _mm_set_epi64x(0, static_cast<int64_t>(a1));
++    c.f[12] = f12;
++    c.pc = addr;
++    for (int passos = 0; passos < 2000000; ++passos)
++    {
++        if (c.pc == kSentinela)
++        {
++            v0 = static_cast<uint64_t>(_mm_extract_epi64(c.r[2], 0));
++            return true;
++        }
++        if (c.pc == 0u || !rt->hasFunction(c.pc))
++        {
++            std::cout << "[testa] parou em pc=0x" << std::hex << c.pc << std::dec << std::endl;
++            return false;
++        }
++        rt->lookupFunction(c.pc)(rdram, &c, rt);
++    }
++    std::cout << "[testa] passos demais" << std::endl;
++    return false;
++}
++
++static void otxTestaDouble(PS2Runtime *rt, uint8_t *rdram)
++{
++    const char *s = std::getenv("PS2X_TESTA_DOUBLE");
++    if (!s || !*s)
++        return;
++    const char *g = std::getenv("PS2X_TESTA_GP");
++    const uint32_t gp = g ? static_cast<uint32_t>(std::strtoul(g, nullptr, 16)) : 0u;
++    auto bits = [](double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; };
++    auto dbl = [](uint64_t u) { double d; std::memcpy(&d, &u, 8); return d; };
++    const double pares[][2] = {{1.5, 2.0}, {0.5, 0.8163265}, {2.0, 0.5}, {3.7, 1.25}, {100.0, 0.1}, {0.12345, 7.0}, {200.0, 3.0}};
++    std::string lista(s);
++    size_t pos = 0;
++    while (pos < lista.size())
++    {
++        size_t fim = lista.find(',', pos);
++        if (fim == std::string::npos) fim = lista.size();
++        const std::string item = lista.substr(pos, fim - pos);
++        pos = fim + 1;
++        const size_t dp = item.find(':');
++        if (dp == std::string::npos) continue;
++        const std::string nome = item.substr(0, dp);
++        const uint32_t addr = static_cast<uint32_t>(std::strtoul(item.c_str() + dp + 1, nullptr, 16));
++        for (const auto &pr : pares)
++        {
++            const double x = pr[0], y = pr[1];
++            double esperado = 0.0;
++            uint64_t a0 = bits(x), a1 = bits(y);
++            float f12 = 0.0f;
++            bool resultadoInteiro = false;
++            if (nome == "dpmul") esperado = x * y;
++            else if (nome == "dpadd") esperado = x + y;
++            else if (nome == "dpsub") esperado = x - y;
++            else if (nome == "dpdiv") esperado = x / y;
++            else if (nome == "pow" || nome == "ipow") esperado = std::pow(x, y);
++            else if (nome == "sqrt") esperado = std::sqrt(x);
++            else if (nome == "litodp") { a0 = static_cast<uint64_t>(static_cast<int64_t>(x * 7)); esperado = static_cast<double>(static_cast<int64_t>(x * 7)); }
++            else if (nome == "dptoli") { esperado = static_cast<double>(static_cast<int32_t>(x * 3.3)); a0 = bits(x * 3.3); resultadoInteiro = true; }
++            else if (nome == "fptodp") { f12 = static_cast<float>(x); esperado = static_cast<double>(f12); }
++            else continue;
++            uint64_t v0 = 0;
++            const bool ok = otxChamaGuest(rt, rdram, addr, gp, a0, a1, f12, v0);
++            const double obtido = resultadoInteiro ? static_cast<double>(static_cast<int32_t>(v0)) : dbl(v0);
++            const bool certo = ok && std::fabs(obtido - esperado) <= 1e-9 * std::max(1.0, std::fabs(esperado));
++            std::printf("[testa] %s(%g, %g) = %.12g esperado %.12g %s\n", nome.c_str(), x, y, obtido, esperado, certo ? "OK" : "ERRADO");
++        }
++    }
++    std::fflush(stdout);
++}
++
+ void PS2Runtime::run()
+ {
+     m_stopRequested.store(false, std::memory_order_relaxed);
+@@ -2347,6 +2521,16 @@ void PS2Runtime::run()
+     ps2_stubs::resetAudioStubState();
+     ps2_stubs::resetMpegStubState();
+     initializeEeKernelState(m_memory.getRDRAM());
++    g_otxRuntime = this;
++    otxTestaDouble(this, m_memory.getRDRAM());
++    otx::vigiaIniciar(m_memory.getRDRAM(), [](uint32_t &pc, uint32_t &ra) {
++        R5900Context *c = g_otxRuntime ? g_otxRuntime->eeScheduler().currentContext() : nullptr;
++        if (c)
++        {
++            pc = c->pc;
++            ra = static_cast<uint32_t>(_mm_extract_epi32(c->r[31], 0));
++        }
++    });
+     m_cpuContext.r[4] = _mm_setzero_si128();
+     m_cpuContext.r[5] = _mm_setzero_si128();
+     m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
+@@ -2386,11 +2570,30 @@ void PS2Runtime::run()
+         gameThreadFinished.store(true, std::memory_order_release); });
+ 
+     uint64_t tick = 0;
++    // Otavix: PS2X_TICK=1 liga o [run:tick] (PC, threads, contadores de DMA/GIF) também nas builds
++    // sem AGRESSIVE_LOGS, a cada 120 quadros do host
++    static const bool tickSempre = std::getenv("PS2X_TICK") != nullptr;
++    // Otavix: PS2X_DUMP_RAM=<segundos>,<arquivo> grava os 32 MB da RAM do EE uma vez nesse tempo
++    static const char *dumpRam = std::getenv("PS2X_DUMP_RAM");
++    static bool ramGravada = false;
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
+-        PS2_IF_AGRESSIVE_LOGS({
++        if (dumpRam && !ramGravada && GetTime() >= std::atof(dumpRam))
++        {
++            ramGravada = true;
++            if (const char *arq = std::strchr(dumpRam, ','))
++            {
++                if (FILE *f = std::fopen(arq + 1, "wb"))
++                {
++                    std::fwrite(m_memory.getRDRAM(), 1, PS2_RAM_SIZE, f);
++                    std::fclose(f);
++                    std::cout << "[dumpram] " << (arq + 1) << std::endl;
++                }
++            }
++        }
++        {
+             tick++;
+-            if ((tick % 120) == 0)
++            if ((tick % 120) == 0 && (tickSempre || PS2_AGRESSIVO_LIGADO))
+             {
+                 uint64_t curDma = m_memory.dmaStartCount();
+                 uint64_t curGif = m_memory.gifCopyCount();
+@@ -2403,7 +2606,25 @@ void PS2Runtime::run()
+                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
+                 const auto eeSnapshot = m_eeScheduler->snapshot();
+ 
+-                RUNTIME_LOG("[run:tick] tick=" << tick
++                static double fpsT0 = GetTime();
++                static uint32_t fpsN0 = 0u;
++                const double fpsAgora = GetTime();
++                const uint32_t fpsN = g_otxTrocas.load(std::memory_order_relaxed);
++                const double fpsJogo = fpsAgora > fpsT0 ? (fpsN - fpsN0) / (fpsAgora - fpsT0) : 0.0;
++                fpsT0 = fpsAgora;
++                fpsN0 = fpsN;
++                static uint64_t nsVu10 = 0u, nsGs0 = 0u;
++                const uint64_t nsVu1 = g_otxNsVu1.load(), nsGs = g_otxNsGs.load();
++                std::cout << "[fps] jogo=" << fpsJogo << " janela=" << GetFPS() << " vu1(+gs)=" << (nsVu1 - nsVu10) / 1e6
++                          << "ms gs=" << (nsGs - nsGs0) / 1e6 << "ms (no intervalo)" << std::endl;
++                nsVu10 = nsVu1;
++                nsGs0 = nsGs;
++                static uint64_t r0 = 0, i0 = 0, c0 = 0, e0 = 0, f0 = 0;
++                const uint64_t f = g_otxVu1Refeitos.load();
++                const uint64_t r = g_otxVu1Runs.load(), i = g_otxVu1Instr.load(), c = g_otxVu1Ciclos.load(), e = g_otxVu1Esgotou.load();
++                std::cout << "[vu1] execuções=" << (r - r0) << " instruções=" << (i - i0) << " ciclos=" << (c - c0) << " sem_fim=" << (e - e0) << " cache_refeito=" << (f - f0) << std::endl;
++                r0 = r; i0 = i; c0 = c; e0 = e; f0 = f;
++                std::cout << ("[run:tick] tick=") << tick
+                                                << " pc=0x" << std::hex << dbgPc
+                                                << " ra=0x" << dbgRa
+                                                << " sp=0x" << dbgSp
+@@ -2416,10 +2637,19 @@ void PS2Runtime::run()
+                                                << " gif=" << curGif
+                                                << " gsw=" << curGs
+                                                << " vif=" << curVif
+-                                               << std::endl);
++                                               << std::endl;
++                // Otavix: cada thread do EE (id, estado, motivo/id da espera, pc, ra)
++                if (tickSempre)
++                {
++                    for (const auto &th : eeSnapshot.threads)
++                        std::cout << "[run:thread] id=" << th.id << " status=" << static_cast<int>(th.status)
++                                  << " espera=" << static_cast<int>(th.waitReason) << "/" << th.waitId
++                                  << " pc=0x" << std::hex << th.pc << " ra=0x" << th.ra << " entry=0x" << th.entry
++                                  << std::dec << " prio=" << th.currentPriority << " wakeups=" << th.wakeupCount << std::endl;
++                }
+ 
+             }
+-        });
++        }
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+@@ -2445,6 +2675,35 @@ void PS2Runtime::run()
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+         }
+         EndDrawing();
++        {
++            // Otavix: PS2X_FOTOS=<pasta> salva um PNG da janela do runtime a cada
++            // PS2X_FOTOS_SEG segundos (padrão 5), para acompanhar testes sem tela
++            static const char *fotos = std::getenv("PS2X_FOTOS");
++            static double proxima = 0.0;
++            if (fotos && *fotos)
++            {
++                static const double intervalo = []() {
++                    const char *s = std::getenv("PS2X_FOTOS_SEG");
++                    const double v = s ? std::atof(s) : 5.0;
++                    return v > 0.5 ? v : 5.0;
++                }();
++                const double agora = GetTime();
++                if (agora >= proxima)
++                {
++                    proxima = agora + intervalo;
++                    // a imagem que o GS produziu (sem o painel de depuração por cima)
++                    Image img = LoadImageFromTexture(frameTex);
++                    // só a área apresentada (o resto da textura fica com lixo de quadros maiores)
++                    if (presentWidth < static_cast<uint32_t>(img.width) || presentHeight < static_cast<uint32_t>(img.height))
++                        ImageCrop(&img, Rectangle{0.0f, 0.0f, static_cast<float>(std::min<uint32_t>(presentWidth, img.width)),
++                                                  static_cast<float>(std::min<uint32_t>(presentHeight, img.height))});
++                    char nome[512];
++                    std::snprintf(nome, sizeof nome, "%s/foto_%05d.png", fotos, static_cast<int>(agora));
++                    ExportImage(img, nome);
++                    UnloadImage(img);
++                }
++            }
++        }
+ 
+         if (WindowShouldClose())
+         {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index f19e281..ac10675 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -1,3 +1,5 @@
++#include <cstdint>
++#include <atomic>
+ #include "runtime/ps2_vu1.h"
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/gs/gs_frontend.h"
+@@ -89,6 +91,7 @@ void VU1Interpreter::resetScheduler()
+     m_stopRequested = false;
+     m_pendingHaltD = false;
+     m_pendingHaltT = false;
++    m_otxProxCommit = 0;
+ }
+ 
+ void VU1Interpreter::reset()
+@@ -194,6 +197,18 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+     applyDest(m_state.acc, result, dest);
+ }
+ 
++// Otavix: PS2X_VU_EXATO=1 liga o recálculo exato (long double) das flags do FMAC; sem ele o
++// resultado em float é o mesmo e só flags de overflow/underflow extremos podem diferir.
++static bool otxVuExato()
++{
++    static const bool exato = []
++    {
++        const char *e = std::getenv("PS2X_VU_EXATO");
++        return e && e[0] == '1';
++    }();
++    return exato;
++}
++
+ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+                                          uint8_t laneFlags[4])
+ {
+@@ -204,7 +219,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+             continue;
+ 
+         long double exactResult = 0.0L;
+-        if (calculateFmacExactResult(component, exactResult))
++        if (otxVuExato() && calculateFmacExactResult(component, exactResult))
+         {
+             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
+             continue;
+@@ -432,6 +447,8 @@ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
+ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+ {
+     uint32_t extraSticky = 0u;
++    if (!otxVuExato())
++        return 0u;
+     const uint32_t upper = m_currentUpperInstruction;
+     const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+     const uint8_t special = op >= 0x3Cu ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : 0xFFu;
+@@ -533,6 +550,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    m_otxProxCommit = std::min(m_otxProxCommit, entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -572,6 +590,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_otxProxCommit = std::min(m_otxProxCommit, entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -591,6 +610,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_otxProxCommit = std::min(m_otxProxCommit, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -615,6 +635,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_otxProxCommit = std::min(m_otxProxCommit, entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +650,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    m_otxProxCommit = std::min(m_otxProxCommit, m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +665,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            m_otxProxCommit = std::min(m_otxProxCommit, entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -660,6 +683,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            m_otxProxCommit = std::min(m_otxProxCommit, store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -681,6 +705,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_otxProxCommit = std::min(m_otxProxCommit, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -707,6 +732,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_otxProxCommit = std::min(m_otxProxCommit, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -728,6 +754,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            m_otxProxCommit = std::min(m_otxProxCommit, write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -744,9 +771,17 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
++    if (m_cycle < m_otxProxCommit)
++        return;
++    uint64_t prox = UINT64_MAX;
++    const auto pendente = [&](uint64_t pronto)
++    {
++        prox = std::min(prox, pronto);
++        return true;
++    };
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        if (!entry.valid || (entry.readyCycle > m_cycle && pendente(entry.readyCycle)))
+             continue;
+ 
+         if (entry.writesMac)
+@@ -765,6 +800,8 @@ void VU1Interpreter::commitReadyPipelines()
+         entry = {};
+     }
+ 
++    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
++        pendente(m_fdiv.readyCycle);
+     if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+     {
+         m_state.q = m_fdiv.value;
+@@ -780,11 +817,13 @@ void VU1Interpreter::commitReadyPipelines()
+             m_state.p = entry.value;
+             entry = {};
+         }
++        else if (entry.valid)
++            pendente(entry.readyCycle);
+     }
+ 
+     for (PendingStore &store : m_storePipeline)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        if (!store.valid || (store.readyCycle > m_cycle && pendente(store.readyCycle)))
+             continue;
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+@@ -802,7 +841,7 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingVfWrite &write : m_vfWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid || (write.readyCycle > m_cycle && pendente(write.readyCycle)))
+             continue;
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+@@ -817,7 +856,7 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingViWrite &write : m_viWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid || (write.readyCycle > m_cycle && pendente(write.readyCycle)))
+             continue;
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+@@ -826,7 +865,7 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingAccWrite &write : m_accWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid || (write.readyCycle > m_cycle && pendente(write.readyCycle)))
+             continue;
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+@@ -838,6 +877,7 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++    m_otxProxCommit = prox;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -1531,9 +1571,12 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
+     return decoded;
+ }
+ 
++std::atomic<uint64_t> g_otxVu1Refeitos{0u};
++
+ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
+                                              const PS2Memory *memory, uint64_t generation)
+ {
++    g_otxVu1Refeitos.fetch_add(1u, std::memory_order_relaxed);
+     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
+     for (uint32_t i = 0; i < pairCount; ++i)
+         m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+@@ -1545,17 +1588,17 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     m_decodedCodeCacheValid = true;
+ }
+ 
+-VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(
++const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::getDecodedInstructionPairForPc(
+     const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc)
+ {
+     if ((pc & 7u) != 0u)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_otxDecodedTemp = decodeInstructionPair(vuCode, pc);
+ 
+     const bool trackedVu1Code = memory != nullptr &&
+                                 ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) ||
+                                  (m_unit == Unit::VU0 && vuCode == memory->getVU0Code()));
+     if (!trackedVu1Code)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_otxDecodedTemp = decodeInstructionPair(vuCode, pc);
+ 
+     const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
+     if (!m_decodedCodeCacheValid ||
+@@ -1568,7 +1611,7 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
+     }
+     const uint32_t pairIndex = pc / 8u;
+     if (pairIndex >= kMaxDecodedPairs)
+-        return decodeInstructionPair(vuCode, pc);
++        return m_otxDecodedTemp = decodeInstructionPair(vuCode, pc);
+     return m_decodedCodeCache[pairIndex];
+ }
+ 
+@@ -1620,10 +1663,17 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 
++// Otavix: contadores de desempenho do VU1 (execuções, instruções, ciclos, execuções que esgotaram o
++// orçamento sem E-bit), lidos pelo [fps] do ps2_runtime.cpp
++std::atomic<uint64_t> g_otxVu1Runs{0u}, g_otxVu1Instr{0u}, g_otxVu1Ciclos{0u}, g_otxVu1Esgotou{0u};
++
+ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
++    const uint64_t otxCiclo0 = m_cycle;
++    uint64_t otxInstr = 0u;
++    g_otxVu1Runs.fetch_add(1u, std::memory_order_relaxed);
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+@@ -1639,7 +1689,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         if (m_state.pc + 8u > codeSize)
+             break;
+ 
+-        const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
++        const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+         {
+             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
+@@ -1820,9 +1870,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+ 
+         advanceOneCycle();
++        ++otxInstr;
+         if (programEnded)
+             break;
+     }
++    g_otxVu1Instr.fetch_add(otxInstr, std::memory_order_relaxed);
++    g_otxVu1Ciclos.fetch_add(m_cycle - otxCiclo0, std::memory_order_relaxed);
++    if (!programEnded)
++        g_otxVu1Esgotou.fetch_add(1u, std::memory_order_relaxed);
+ 
+     if (programEnded)
+     {

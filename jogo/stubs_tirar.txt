@@ -1,0 +1,15 @@
+# Família malloc da newlib: roda o código do jogo (o gerenciador de memória dele lê o tamanho dos blocos)
+malloc
+free
+calloc
+realloc
+_malloc_r
+_free_r
+_calloc_r
+_realloc_r
+_malloc_trim_r
+malloc_extend_top
+__malloc_lock
+__malloc_unlock
+memalign
+_memalign_r
