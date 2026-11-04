@@ -14,6 +14,11 @@ def lista_stubs(toml_txt):
 
 
 def main():
+    # Otavix (04/11): saída redirecionada no Windows é cp1252 e quebrava no '→' (etapa 4 falhava)
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
     pasta, elf = sys.argv[1], sys.argv[2]
     an = open(os.path.join(pasta, 'analisador.toml'), encoding='utf-8').read()
     gh = open(os.path.join(pasta, 'ghidra_config.toml'), encoding='utf-8').read()

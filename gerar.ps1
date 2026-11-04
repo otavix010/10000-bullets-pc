@@ -90,7 +90,11 @@ function Etapa([string]$nome, [scriptblock]$corpo) {
     Set-Content -Path $marca -Value (Get-Date) -Encoding UTF8
     Msg ("{0}: ok ({1:N0} s)" -f $nome, ((Get-Date) - $t0).TotalSeconds)
 }
-function Sha1([string]$arq) { (Get-FileHash -Algorithm SHA1 -LiteralPath $arq).Hash.ToLower() }
+function Sha1([string]$arq) {
+    $r = Get-FileHash -Algorithm SHA1 -LiteralPath $arq -ErrorAction SilentlyContinue
+    if (-not $r) { throw "não consegui ler `"$arq`" (aberto em outro programa, ainda baixando ou só na nuvem, sem cópia local?)" }
+    $r.Hash.ToLower()
+}
 
 # ---------------------------------------------------------------------------- ferramentas
 function Achar-VS {
@@ -100,12 +104,31 @@ function Achar-VS {
     if ($p) { return ($p | Select-Object -First 1) }
     return $null
 }
+# o git só vale se rodar (um MinGit incompleto ou barrado pelo antivírus sai com 0xC0000135): o portátil quebrado é
+# apagado para a etapa 1 baixar de novo
+function Git-Roda([string]$exe) {
+    try { $o = & $exe --version 2>$null; return ($LASTEXITCODE -eq 0 -and "$o" -match 'git version') } catch { return $false }
+}
 function Achar-Git {
     $g = Get-Command git.exe -ErrorAction SilentlyContinue
-    if ($g) { return $g.Source }
+    if ($g -and (Git-Roda $g.Source)) { return $g.Source }
     $m = Join-Path $R 'dl\mingit\cmd\git.exe'
-    if (Test-Path -LiteralPath $m) { return $m }
+    if (Test-Path -LiteralPath $m) {
+        if (Git-Roda $m) { return $m }
+        Remove-Item -LiteralPath (Join-Path $R 'dl\mingit') -Recurse -Force -ErrorAction SilentlyContinue
+    }
     return $null
+}
+function Baixa-MinGit {
+    Msg "baixando o Git portátil (MinGit) de $MINGIT_URL"
+    $zip = Join-Path $R 'dl\mingit.zip'
+    New-Item -ItemType Directory -Force (Join-Path $R 'dl') | Out-Null
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $ProgressPreference = 'SilentlyContinue'
+    Invoke-WebRequest -Uri $MINGIT_URL -OutFile $zip -UseBasicParsing
+    Expand-Archive -Path $zip -DestinationPath (Join-Path $R 'dl\mingit') -Force
+    Remove-Item $zip
+    if (-not (Achar-Git)) { throw 'o Git portátil não roda (dl\mingit\cmd\git.exe). Se o antivírus bloqueou, libere a pasta do port e gere de novo.' }
 }
 Etapa '1_ferramentas' {
     $falta = @()
@@ -119,21 +142,12 @@ Etapa '1_ferramentas' {
                   "`r`n    winget install Microsoft.VisualStudio.2022.BuildTools --override `"--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.CMake.Project --includeRecommended`""
     }
     if ($falta) { throw ("Falta instalar:`r`n  - " + ($falta -join "`r`n  - ")) }
-    if (-not (Achar-Git)) {
-        Msg "baixando o Git portátil (MinGit) de $MINGIT_URL"
-        $zip = Join-Path $R 'dl\mingit.zip'
-        New-Item -ItemType Directory -Force (Join-Path $R 'dl') | Out-Null
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $MINGIT_URL -OutFile $zip -UseBasicParsing
-        Expand-Archive -Path $zip -DestinationPath (Join-Path $R 'dl\mingit') -Force
-        Remove-Item $zip
-        if (-not (Achar-Git)) { throw 'o Git portátil não ficou em dl\mingit' }
-    }
+    if (-not (Achar-Git)) { Baixa-MinGit }
 }
 $VS = Achar-VS
 if (-not $VS) { throw 'Visual Studio Build Tools com C++ e CMake não encontrado (rode de novo a etapa 1: -RefazerDe 1)' }
 $GIT = Achar-Git
+if (-not $GIT) { Baixa-MinGit; $GIT = Achar-Git } # o portátil sumiu ou quebrou depois da etapa 1
 # o CMake baixa as dependências do PS2Recomp com o git: o portátil precisa estar no PATH
 $env:PATH = (Split-Path $GIT) + ';' + $env:PATH
 # o vcvars64.bat procura o vswhere.exe no PATH
@@ -143,6 +157,9 @@ $VCVARS = Join-Path $VS 'VC\Auxiliary\Build\vcvars64.bat'
 $TMPC = Join-Path $R 'out\tmp'
 New-Item -ItemType Directory -Force $TMPC | Out-Null
 function ComVS([string]$linha) { "call `"$VCVARS`" >nul && set `"TEMP=$TMPC`" && set `"TMP=$TMPC`" && $linha" }
+# sem o Windows SDK o CMake falha em "Detecting C compiler ABI" (RC Pass 1 failed, CMAKE_MT-NOTFOUND): avisa antes
+cmd /c (ComVS 'where rc.exe mt.exe') *> $null
+if ($LASTEXITCODE -ne 0) { throw 'falta o Windows SDK (rc.exe/mt.exe) no Visual Studio Build Tools. Abra o Visual Studio Installer > Modificar > marque "SDK do Windows 11" (ou 10) e gere de novo.' }
 
 # ---------------------------------------------------------------------------- disco
 function Escolher-Iso([string]$texto) {
@@ -161,15 +178,19 @@ Etapa '2_disco' {
         $Iso = Escolher-Iso "Escolha a ISO do $($JOGO.nome) ($($JOGO.versao))"
         if (-not $Iso) { throw 'sem a ISO do jogo' }
     }
+    if (Test-Path -LiteralPath $Iso -PathType Container) { throw "$Iso é uma pasta, não a ISO: escolha o arquivo .iso do jogo (imagem do DVD original, $($JOGO.serial); cópias ripadas/dubladas em pasta não servem)" }
+    if (-not (Test-Path -LiteralPath $Iso -PathType Leaf)) { throw "a ISO não existe: $Iso (escolha o arquivo .iso de novo)" }
     $Iso = (Resolve-Path -LiteralPath $Iso).Path
-    Msg "conferindo a ISO ($([math]::Round((Get-Item -LiteralPath $Iso).Length / 1GB, 2)) GB)"
+    $tam = (Get-Item -LiteralPath $Iso).Length
+    if ($tam -lt 100MB) { throw "a ISO tem só $([math]::Round($tam / 1MB, 1)) MB: arquivo incompleto ou não é a ISO do jogo (escolha o arquivo .iso de novo)" }
+    Msg "conferindo a ISO ($([math]::Round($tam / 1GB, 2)) GB)"
     $h = Sha1 $Iso
     Anotar $LOG "SHA-1 da ISO: $h"
     if ($JOGO.iso_sha1 -notcontains $h) {
         Msg "AVISO: a ISO não é a cópia testada (SHA-1 $h). Vou conferir o executável do jogo."
     }
     Msg 'extraindo os arquivos do disco para trabalho\disc'
-    Exec $LOG "python -I `"$R\ferramentas\extrai_iso.py`" `"$Iso`" `"$T\disc`""
+    Exec $LOG "python -I `"$R\ferramentas\extrai_iso.py`" `"$Iso`" `"$T\disc`" --elf `"$($JOGO.elf)`""
     if (-not (Test-Path -LiteralPath $ELF)) { throw "o executável $($JOGO.elf) não está nessa ISO: é a versão $($JOGO.versao)?" }
     $he = Sha1 $ELF
     if ($JOGO.elf_sha1 -notcontains $he) {
@@ -188,18 +209,18 @@ Etapa '3_ps2recomp' {
     } else {
         if (Test-Path -LiteralPath $P) { Remove-Item -LiteralPath $P -Recurse -Force }
         Msg "baixando o PS2Recomp ($PS2RECOMP_URL)"
-        Exec $LOG "`"$GIT`" clone --quiet $PS2RECOMP_URL `"$P`""
+        Exec $LOG "`"$GIT`" -c safe.directory=* clone --quiet $PS2RECOMP_URL `"$P`""
     }
     # --force descarta as correções antigas: elas são aplicadas de novo logo abaixo
-    Exec $LOG "`"$GIT`" -C `"$P`" -c advice.detachedHead=false checkout --force --quiet $PS2RECOMP_SHA"
-    Exec $LOG "`"$GIT`" -C `"$P`" clean -fdq ps2xRuntime"
+    Exec $LOG "`"$GIT`" -c safe.directory=* -C `"$P`" -c advice.detachedHead=false checkout --force --quiet $PS2RECOMP_SHA"
+    Exec $LOG "`"$GIT`" -c safe.directory=* -C `"$P`" clean -fdq ps2xRuntime ps2xIOP"
     foreach ($pt in Get-ChildItem (Join-Path $R 'patches') -Filter '*.patch' | Sort-Object Name) {
         Msg "aplicando patches\$($pt.Name)"
-        Exec $LOG "`"$GIT`" -C `"$P`" apply --whitespace=nowarn `"$($pt.FullName)`""
+        Exec $LOG "`"$GIT`" -c safe.directory=* -C `"$P`" apply --whitespace=nowarn `"$($pt.FullName)`""
     }
     Msg 'compilando o tradutor (ps2_recomp)'
     $b = Join-Path $P 'out\ferramentas'
-    Exec $LOG (ComVS "cmake -S `"$P`" -B `"$b`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DPS2X_BUILD_ANALYZER=OFF")
+    Exec $LOG (ComVS "cmake -S `"$P`" -B `"$b`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS2X_AVX2=OFF -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DPS2X_BUILD_ANALYZER=OFF")
     Exec $LOG (ComVS "cmake --build `"$b`" --target ps2_recomp")
 }
 $RECOMP = Get-ChildItem (Join-Path $P 'out\ferramentas') -Recurse -Filter 'ps2_recomp.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -207,7 +228,7 @@ $RECOMP = Get-ChildItem (Join-Path $P 'out\ferramentas') -Recurse -Filter 'ps2_r
 # ---------------------------------------------------------------------------- tradução
 Etapa '4_traduzir' {
     if (-not $RECOMP) { throw 'o ps2_recomp.exe não foi compilado (rode -RefazerDe 3)' }
-    foreach ($a in 'analisador.toml', 'ghidra_config.toml', 'ghidra_funcoes.csv', 'entradas_extra.txt', 'stubs_extra.txt', 'stubs_tirar.txt') {
+    foreach ($a in 'analisador.toml', 'ghidra_config.toml', 'ghidra_funcoes.csv', 'entradas_extra.txt', 'stubs_extra.txt', 'stubs_tirar.txt', 'remendos.txt') {
         $o = Join-Path $R "jogo\$a"
         if (Test-Path -LiteralPath $o) { Copy-Item -LiteralPath $o $T -Force }
     }
