@@ -6,7 +6,7 @@
 
 ## O que é
 
-Um port **nativo** do *10.000 Bullets* (PlayStation 2, 2005) para Windows. Não é um emulador: o código do jogo é **traduzido para C++ e compilado** para x86-64 (recompilação estática), em cima do [PS2Recomp](https://github.com/ran-j/PS2Recomp).
+Um port **nativo** do *10.000 Bullets* (PlayStation 2, 2005) para Windows. Não é um emulador: o código do jogo é **traduzido para C++ e compilado** para x86-64 (recompilação estática), com o motor PS2 próprio do projeto (Otavix).
 
 Como o código do jogo não pode ser distribuído, **o seu PC gera e compila a parte do jogo a partir da sua ISO**. Um comando só faz tudo.
 
@@ -29,39 +29,35 @@ O [Otavix Launcher](https://github.com/otavix010/otavix-launcher/releases/latest
 winget install Python.Python.3.12
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.CMake.Project --includeRecommended"
 ```
-O resto o gerador baixa sozinho: o PS2Recomp (na versão fixada), as bibliotecas dele e, se o PC não tiver Git, o Git portátil (MinGit).
+O resto o gerador baixa sozinho: o motor do port (pacote pronto, conferido pelo SHA-256) e o FFmpeg (LGPL). Não precisa de Git.
 
-**3. Baixe este repositório** (botão *Code > Download ZIP*, ou `git clone`) e extraia numa pasta **sem espaços no caminho**, por exemplo `C:\10000-bullets-pc`. Deixe uns 15 GB livres nesse disco (o código traduzido e a compilação ocupam bastante).
+**3. Baixe este repositório** (botão *Code > Download ZIP*, ou `git clone`) e extraia numa pasta **sem espaços no caminho**, por exemplo `C:\10000-bullets-pc`. Deixe uns 5 GB livres nesse disco (os arquivos do disco, o código traduzido e a compilação).
 
 **4. Clique duas vezes em `gerar.cmd`** e escolha a ISO. Ele:
 - confere a ISO e extrai os arquivos do disco para `trabalho\disc`;
-- baixa o PS2Recomp, aplica as nossas correções (`patches\`) e compila o tradutor;
+- baixa o motor do port (pacote pronto, conferido pelo SHA-256);
 - traduz o código do jogo para C++ (só no seu PC);
-- compila o jogo (de 20 minutos a 1 hora, conforme o PC; precisa de 16 GB de RAM ou mais).
+- compila o código do jogo (de 5 a 30 minutos, conforme o PC; precisa de 16 GB de RAM ou mais).
 
 **5. Jogue com `jogar.cmd`.** O jogo lê os arquivos de `trabalho\disc` e a ISO no lugar onde ela estava na geração (se mudar a ISO de lugar, rode `gerar.cmd -RefazerDe 2`).
 
-Depois de atualizar o port, `gerar.cmd -RefazerDe 3` aplica as correções novas, retraduz e recompila sem extrair o disco de novo.
+Depois de atualizar o port, `gerar.cmd -RefazerDe 3` baixa o motor novo, retraduz e recompila sem extrair o disco de novo.
 
 ## Como funciona
 
-- **PS2Recomp** traduz o executável do PS2 (MIPS R5900, o "Emotion Engine") para C++ e compila com o runtime dele (GS por software, VU1, DMA, IOP, áudio, cartão de memória).
-- **O mapa de funções** (`jogo\ghidra_funcoes.csv`) veio de uma análise com o [Ghidra](https://ghidra-sre.org/) e a extensão [ghidra-emotionengine-reloaded](https://github.com/chaoticgd/ghidra-emotionengine-reloaded): são só endereços e nomes, nada do código do jogo. `jogo\entradas_extra.txt` lista funções chamadas só por ponteiro e alvos de tabelas de salto que a análise não marcou, e `jogo\stubs_extra.txt` as funções trocadas por respostas fixas (por exemplo, vídeos pulados por enquanto).
-- **As nossas correções no PS2Recomp** (GPLv3 como ele):
-  - no tradutor (`patches\recomp_otavix.patch`): os desvios BLTZ/BGEZ/BLEZ/BGTZ testam o registrador inteiro de 64 bits, como no EE (antes, a subtração de `double` por software e o `pow` davam lixo);
-  - no runtime (`patches\runtime_otavix.patch`): interrupções que respeitam o `di`/`ei` do EE, pilha do `SetupThread` no topo da RAM, pilha do executável de 256 MB (o código traduzido tem funções com quadros de mais de 1 MB), pacotes internos numa área do kernel em vez do heap do jogo, callback do `sceCdCallback`, comandos SIF do EE entregues aos módulos que rodam no IOP emulado, leitura de setores direto da ISO, transferência de som EE→IOP, `sceCdReadDvdDualInfo`, cache de textura invalidado nos uploads, VU1 mais rápido e ferramentas de diagnóstico;
-  - na montagem (`ferramentas\monta_config.py`): as funções de `double` da libm (`pow`, `sin`, `sqrt`…) rodam o código do próprio jogo em vez dos substitutos de `float` do runtime.
+- **O motor** (tradutor MIPS R5900 → C++ e runtime: GS, VU1, DMA, IOP, áudio SPU2, cartão de memória) é próprio do projeto e vem pronto (bibliotecas compiladas); o seu PC só traduz e compila o código do jogo.
+- **O mapa de funções** (`jogo\ghidra_funcoes.csv`) veio de uma análise com o [Ghidra](https://ghidra-sre.org/) e a extensão ghidra-emotionengine-reloaded: são só endereços e nomes, nada do código do jogo. `jogo\entradas_extra.txt` lista funções chamadas só por ponteiro e alvos de tabelas de salto que a análise não marcou, e `jogo\stubs_extra.txt` as funções trocadas por respostas fixas (por exemplo, vídeos pulados por enquanto).
 
 ## Licença e créditos
 
 - **O nosso código** (`gerar.ps1`, `gerar.cmd`, `ferramentas\`): [MIT](LICENSE).
-- **PS2Recomp** (baixado pelo gerador) e **as nossas correções nele** (`patches\`): [GPLv3](https://github.com/ran-j/PS2Recomp/blob/main/LICENSE), de ran-j e colaboradores. O executável gerado no seu PC também é GPLv3.
+- **O motor do port** (pacote `otx-motor-ps2`, baixado pronto pelo gerador) não é coberto pela licença MIT; os avisos de terceiros dele (raylib e glfw: zlib; FFmpeg: LGPL, DLLs à parte) estão no `TERCEIROS.txt` do pacote.
 - *10.000 Bullets* (*Tsukiyo ni Saraba*) é da Blue Moon Studio e da Taito. Este é um projeto de fãs, sem fins lucrativos, sem relação com a Blue Moon Studio nem a Taito/Square Enix nem endossado por elas.
 
 ## English summary
 
-A **native PC port** of *10.000 Bullets* (PlayStation 2, 2005) made by **static recompilation** with [PS2Recomp](https://github.com/ran-j/PS2Recomp). **Work in progress.**
+A **native PC port** of *10.000 Bullets* (PlayStation 2, 2005) made by **static recompilation** with the project's own PS2 engine. **Work in progress.**
 
-**Bring your own game**: no game code or data here, only the function map (addresses) and translation settings. You need the **European** release (SLES-53481, Redump "10.000 Bullets (Europe) (En,Fr,De,Es,It)") as an **.iso**. Install Python 3.11+ and Visual Studio 2022 Build Tools with C++ and CMake (commands above), download this repository to a path without spaces, double-click **`gerar.cmd`** (it checks your ISO, extracts the disc files, fetches the pinned PS2Recomp, applies our runtime patches, translates the game code on your PC and builds it), then play with **`jogar.cmd`**.
+**Bring your own game**: no game code or data here, only the function map (addresses) and translation settings. You need the **European** release (SLES-53481, Redump "10.000 Bullets (Europe) (En,Fr,De,Es,It)") as an **.iso**. Install Python 3.11+ and Visual Studio 2022 Build Tools with C++ and CMake (commands above), download this repository to a path without spaces, double-click **`gerar.cmd`** (it checks your ISO, extracts the disc files, downloads the prebuilt engine package (no Git needed), translates the game code on your PC and builds it, in 5 to 30 minutes), then play with **`jogar.cmd`**.
 
-License: our scripts are MIT; PS2Recomp and our patches to it are GPLv3. *10,000 Bullets* (*Tsukiyo ni Saraba*) belongs to Blue Moon Studio and Taito; this is a non-commercial fan project, not affiliated with or endorsed by Blue Moon Studio or Taito/Square Enix.
+License: our scripts are MIT; the engine package is not covered by it, and its third-party notices are in its `TERCEIROS.txt`. *10,000 Bullets* (*Tsukiyo ni Saraba*) belongs to Blue Moon Studio and Taito; this is a non-commercial fan project, not affiliated with or endorsed by Blue Moon Studio or Taito/Square Enix.
