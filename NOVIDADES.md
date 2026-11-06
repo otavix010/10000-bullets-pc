@@ -1,7 +1,21 @@
 # Novidades do port
 
 O Otavix Launcher mostra este arquivo na página "Novidades" do jogo. Cada atualização tem um título
-"## <data> · <versão>" e o texto em português (### pt) e inglês (### en). As mais novas ficam em cima.
+"## 06/11/2026 · 0.1.2
+### pt
+- **Mais fps pelo launcher**: aberto pelo launcher, o jogo deixava de usar a thread própria de desenho e esperava a placa de vídeo a cada quadro. Isso derrubava o fps, principalmente em placas de entrada (RTX 5060, por exemplo). Corrigido.
+- Reduções e ampliações de imagem que o jogo faz nos efeitos agora seguem o PS2 ponto a ponto.
+- Motor 0.1.2: na próxima geração o gerador refaz da etapa 3 sozinho (o disco extraído continua valendo).
+### en
+- **More fps from the launcher**: when opened from the launcher, the game stopped using its own drawing thread and waited for the graphics card every frame. That lowered the fps, mostly on entry-level cards (an RTX 5060, for example). Fixed.
+- Picture reductions and enlargements the game does in its effects now match the PS2 pixel for pixel.
+- Engine 0.1.2: on the next generation the generator redoes it from step 3 on its own (the extracted disc is kept).
+### es
+- **Más fps desde el launcher**: abierto desde el launcher, el juego dejaba de usar su propio hilo de dibujo y esperaba a la tarjeta gráfica en cada fotograma. Eso bajaba los fps, sobre todo en tarjetas de entrada (una RTX 5060, por ejemplo). Corregido.
+- Las reducciones y ampliaciones de imagen que el juego hace en sus efectos ahora siguen a la PS2 píxel a píxel.
+- Motor 0.1.2: en la próxima generación el generador rehace desde la etapa 3 solo (el disco extraído se mantiene).
+
+## <data> · <versão>" e o texto em português (### pt) e inglês (### en). As mais novas ficam em cima.
 
 ## 06/11/2026 · 0.1.1
 ### pt
