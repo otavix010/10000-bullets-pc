@@ -26,10 +26,9 @@ O [Otavix Launcher](https://github.com/otavix010/otavix-launcher/releases/latest
 
 **2. Instale as ferramentas (uma vez só)**, num terminal:
 ```
-winget install Python.Python.3.12
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.CMake.Project --includeRecommended"
 ```
-O resto o gerador baixa sozinho: o motor do port (pacote pronto, conferido pelo SHA-256) e o FFmpeg (LGPL). Não precisa de Git.
+O resto o gerador baixa sozinho: o motor do port (pacote pronto, conferido pelo SHA-256) e o FFmpeg (LGPL). Não precisa de Python nem de Git.
 
 **3. Baixe este repositório** (botão *Code > Download ZIP*, ou `git clone`) e extraia numa pasta **sem espaços no caminho**, por exemplo `C:\10000-bullets-pc`. Deixe uns 5 GB livres nesse disco (os arquivos do disco, o código traduzido e a compilação).
 
@@ -58,6 +57,6 @@ Depois de atualizar o port, `gerar.cmd -RefazerDe 3` baixa o motor novo, retradu
 
 A **native PC port** of *10.000 Bullets* (PlayStation 2, 2005) made by **static recompilation** with the project's own PS2 engine. **Work in progress.**
 
-**Bring your own game**: no game code or data here, only the function map (addresses) and translation settings. You need the **European** release (SLES-53481, Redump "10.000 Bullets (Europe) (En,Fr,De,Es,It)") as an **.iso**. Install Python 3.11+ and Visual Studio 2022 Build Tools with C++ and CMake (commands above), download this repository to a path without spaces, double-click **`gerar.cmd`** (it checks your ISO, extracts the disc files, downloads the prebuilt engine package (no Git needed), translates the game code on your PC and builds it, in 5 to 30 minutes), then play with **`jogar.cmd`**.
+**Bring your own game**: no game code or data here, only the function map (addresses) and translation settings. You need the **European** release (SLES-53481, Redump "10.000 Bullets (Europe) (En,Fr,De,Es,It)") as an **.iso**. Install Visual Studio 2022 Build Tools with C++ and CMake (commands above), download this repository to a path without spaces, double-click **`gerar.cmd`** (it checks your ISO, extracts the disc files, downloads the prebuilt engine package (no Git needed), translates the game code on your PC and builds it, in 5 to 30 minutes), then play with **`jogar.cmd`**.
 
 License: our scripts are MIT; the engine package is not covered by it, and its third-party notices are in its `TERCEIROS.txt`. *10,000 Bullets* (*Tsukiyo ni Saraba*) belongs to Blue Moon Studio and Taito; this is a non-commercial fan project, not affiliated with or endorsed by Blue Moon Studio or Taito/Square Enix.
