@@ -1,7 +1,23 @@
 # Novidades do port
 
 O Otavix Launcher mostra este arquivo na página "Novidades" do jogo. Cada atualização tem um título
-"## 06/11/2026 · 0.1.2
+"## <data> · <versão>" e o texto em português (### pt), inglês (### en) e espanhol (### es). As mais novas ficam em cima.
+
+## 22/11/2026 · 0.1.3
+### pt
+- **ISO montada no Windows**: escolhida pela letra do drive (por exemplo, F:\), o gerador agora mostra o caminho do arquivo .iso para escolher no lugar dela.
+- **DVD no leitor**: o gerador agora explica que é preciso criar antes a ISO do DVD e escolher esse arquivo.
+- **Pasta com a ISO dentro**: com uma só .iso na pasta, o gerador usa essa; com várias, lista os nomes para escolher a certa.
+### en
+- **ISO mounted in Windows**: when picked by its drive letter (for example, F:\), the generator now shows the path of the .iso file to pick instead.
+- **DVD in the drive**: the generator now explains that you first need to make an ISO of the DVD and pick that file.
+- **Folder with the ISO inside**: with a single .iso in the folder, the generator uses it; with several, it lists their names so you can pick the right one.
+### es
+- **ISO montada en Windows**: elegida por la letra de la unidad (por ejemplo, F:\), el generador ahora muestra la ruta del archivo .iso para elegirlo en su lugar.
+- **DVD en la unidad**: el generador ahora explica que primero hay que crear la ISO del DVD y elegir ese archivo.
+- **Carpeta con la ISO dentro**: con una sola .iso en la carpeta, el generador la usa; con varias, muestra sus nombres para elegir la correcta.
+
+## 06/11/2026 · 0.1.2
 ### pt
 - **Mais fps pelo launcher**: aberto pelo launcher, o jogo deixava de usar a thread própria de desenho e esperava a placa de vídeo a cada quadro. Isso derrubava o fps, principalmente em placas de entrada (RTX 5060, por exemplo). Corrigido.
 - Reduções e ampliações de imagem que o jogo faz nos efeitos agora seguem o PS2 ponto a ponto.
@@ -15,7 +31,6 @@ O Otavix Launcher mostra este arquivo na página "Novidades" do jogo. Cada atual
 - Las reducciones y ampliaciones de imagen que el juego hace en sus efectos ahora siguen a la PS2 píxel a píxel.
 - Motor 0.1.2: en la próxima generación el generador rehace desde la etapa 3 solo (el disco extraído se mantiene).
 
-## <data> · <versão>" e o texto em português (### pt) e inglês (### en). As mais novas ficam em cima.
 
 ## 06/11/2026 · 0.1.1
 ### pt
