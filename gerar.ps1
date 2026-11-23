@@ -513,6 +513,32 @@ Etapa '6_compilar' {
     $pac = $PAC.Replace('\', '/')
     Msg "compilando o jogo ($Jobs compilações em paralelo, motor $VARIANTE; de 5 a 30 min)"
     $cfg = "`"-DOTX_PACOTE=$pac`" -DOTX_VARIANTE=$VARIANTE `"-DPS2X_VU1_LANCADOR=$lancador`""
+    # 22/11 (report 1451): pasta do port copiada de outro lugar depois de compilar: o cache do CMake guarda a pasta antiga
+    # e o cmake recusa ("CMakeCache.txt directory ... is different"); apaga a compilação antiga e compila de novo aqui
+    $cacheCM = Join-Path $BJ 'CMakeCache.txt'
+    if (Test-Path -LiteralPath $cacheCM) {
+        $outra = $null
+        foreach ($l in [IO.File]::ReadAllLines($cacheCM)) {
+            if ($l -match '^(CMAKE_HOME_DIRECTORY|CMAKE_CACHEFILE_DIR):INTERNAL=(.+)$') {
+                $esperado = if ($Matches[1] -eq 'CMAKE_HOME_DIRECTORY') { $C } else { $BJ }
+                $lido = $Matches[2].Trim()
+                try { $igual = [IO.Path]::GetFullPath($lido.Replace('/', '\')).TrimEnd('\') -eq [IO.Path]::GetFullPath($esperado).TrimEnd('\') }
+                catch { $igual = $false }
+                if (-not $igual) { $outra = $lido; break }
+            }
+        }
+        if ($outra) {
+            Msg ("a compilação anterior foi feita em outra pasta ($outra): apagando-a para compilar aqui / " +
+                 "the previous build was made in another folder: deleting it to build here / " +
+                 "la compilación anterior se hizo en otra carpeta: borrándola para compilar aquí")
+            try { Remove-Item -LiteralPath $BJ -Recurse -Force -ErrorAction Stop }
+            catch {
+                throw ("não deu para apagar $BJ ($($_.Exception.Message)): feche o jogo, se estiver aberto, apague essa pasta e gere de novo.`r`n" +
+                       "  Could not delete ${BJ}: close the game if it is running, delete that folder and generate again.`r`n" +
+                       "  No se pudo borrar ${BJ}: cierra el juego si está abierto, borra esa carpeta y genera de nuevo.")
+            }
+        }
+    }
     Exec $LOG (ComVS "cmake -S `"$C`" -B `"$BJ`" -G Ninja $cfg")
     Exec $LOG (ComVS "cmake --build `"$BJ`" --target ps2EntryRunner --parallel $Jobs")
     if (-not (Test-Path (Join-Path $BJ 'ps2xRuntime\ps2EntryRunner.exe'))) { throw "o executável não foi gerado (veja $LOG)" }
